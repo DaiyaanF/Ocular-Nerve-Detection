@@ -4,167 +4,225 @@ import matplotlib.pyplot as plt
 import os
 
 class OpticDiscDetector:
-    def __init__(self):
+    # Default calibration constants (used when no external calibration is supplied).
+    #   Fundus  – 30° FOV, ~512 px across ~9.4 mm of retina  → ~54 px/mm
+    #   B-scan  – standard ophthalmic ultrasound, ~77 µm/px  → ~13 px/mm
+    DEFAULT_PPM_FUNDUS = 54.0   # pixels per mm
+    DEFAULT_PPM_BSCAN  = 13.0   # pixels per mm
+
+    def __init__(self, pixels_per_mm=None):
         self.debug = True
-        self.image_type = None  # Will be set to fundus or bscan
-        
+        self.image_type = None  # 'fundus' or 'bscan'
+        # If supplied, overrides the per-type defaults for both image types.
+        self.pixels_per_mm = pixels_per_mm
+
+    @property
+    def _ppm(self):
+        """Return the effective pixels-per-mm for the current image type."""
+        if self.pixels_per_mm is not None:
+            return float(self.pixels_per_mm)
+        if self.image_type == 'bscan':
+            return self.DEFAULT_PPM_BSCAN
+        return self.DEFAULT_PPM_FUNDUS
+
+    def px_to_mm(self, pixels):
+        """Convert a pixel distance/length to millimetres."""
+        if pixels is None:
+            return None
+        return pixels / self._ppm
+
+    def px2_to_mm2(self, pixels_sq):
+        """Convert a pixel² area to mm²."""
+        if pixels_sq is None:
+            return None
+        return pixels_sq / (self._ppm ** 2)
+
+    # ============================================================
+    # IMAGE LOADING & TYPE DETECTION
+    # ============================================================
+
     def load_image(self, image_path):
         """Load and return grayscale image"""
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise ValueError(f"Cannot load image: {image_path}")
         return image
-    
+
     def detect_image_type(self, image):
-        """Automatically detect if image is fundus or B-scan based on characteristics"""
+        """
+        Detect whether the image is a fundus photograph or a B-scan.
+
+        Decision uses three independent signals — any two out of three votes
+        for B-scan wins.
+
+        Signal 1 – Aspect ratio
+            B-scans are typically 2:1 to 4:1 wide; fundus images are ~1:1.
+            Score: +1 if w/h > 1.8
+
+        Signal 2 – Vertical gradient dominance
+            B-scans have horizontal tissue layers → large row-to-row (axis=0)
+            intensity changes relative to column-to-column (axis=1) changes.
+            np.diff(axis=0) measures how much intensity changes between rows.
+            np.diff(axis=1) measures how much intensity changes between columns.
+            Score: +1 if std(row-diffs) / std(col-diffs) > 1.05
+
+        Signal 3 – Top-dark / bottom-bright pattern
+            In a B-scan the vitreous (top) is near-black; the retinal wall and
+            sclera at the bottom are bright echoes.  Fundus images are
+            roughly uniformly lit.
+            Score: +1 if mean(bottom-third) > mean(top-third) * 1.4
+        """
         h, w = image.shape
         aspect_ratio = w / h
-        
-        # B-scans are typically wider than tall (aspect ratio > 2)
-        # and have characteristic horizontal layering
-        if aspect_ratio > 2.0:
-        
-            horizontal_gradient = np.diff(image, axis=0)
-            horizontal_variation = np.std(horizontal_gradient)
-            
-            vertical_gradient = np.diff(image, axis=1)
-            vertical_variation = np.std(vertical_gradient)
-            
-        
-            if horizontal_variation > vertical_variation * 1.5:
-                self.image_type = 'bscan'
-                if self.debug:
-                    print(f"Detected B-scan image (aspect: {aspect_ratio:.2f})")
-                return 'bscan'
-        
+
+        score = 0
+
+        # Signal 1: aspect ratio
+        if aspect_ratio > 1.8:
+            score += 1
+
+        # Signal 2: row-to-row vs col-to-col gradient (corrected axis names)
+        row_diff_std = np.std(np.diff(image.astype(float), axis=0))  # vertical gradient
+        col_diff_std = np.std(np.diff(image.astype(float), axis=1))  # horizontal gradient
+        if col_diff_std > 0 and row_diff_std / col_diff_std > 1.05:
+            score += 1
+
+        # Signal 3: dark vitreous on top, bright reflections on bottom
+        top_mean = float(np.mean(image[:h // 3, :]))
+        bot_mean = float(np.mean(image[2 * h // 3:, :]))
+        if top_mean > 0 and bot_mean / top_mean > 1.4:
+            score += 1
+
+        if score >= 2:
+            self.image_type = 'bscan'
+            if self.debug:
+                print(f"Detected B-scan (AR={aspect_ratio:.2f}, score={score}/3)")
+            return 'bscan'
+
         self.image_type = 'fundus'
         if self.debug:
-            print(f"Detected fundus image (aspect: {aspect_ratio:.2f})")
+            print(f"Detected fundus (AR={aspect_ratio:.2f}, score={score}/3)")
         return 'fundus'
-    
+
+    # ============================================================
+    # PREPROCESSING
+    # ============================================================
+
     def preprocess_fundus_image(self, image):
         """Preprocessing for fundus images"""
         blurred = cv2.GaussianBlur(image, (5, 5), 0)
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(blurred)
         return enhanced
-    
+
     def preprocess_bscan_image(self, image):
         """Preprocessing specifically for B-scan images"""
-        # B-scans often have speckle noise, use different denoising
         denoised = cv2.bilateralFilter(image, 9, 75, 75)
-        
-
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 4))  
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 4))
         enhanced = clahe.apply(denoised)
-   
         kernel_horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
-        enhanced = cv2.morphologyEx(enhanced, cv2.MORPH_TOPHAT, kernel_horizontal)
-        enhanced = cv2.add(image, enhanced)
-        
+        tophat = cv2.morphologyEx(enhanced, cv2.MORPH_TOPHAT, kernel_horizontal)
+        enhanced = cv2.add(image, tophat)
         return enhanced
-    
+
     def preprocess_image(self, image):
         """Adaptive preprocessing based on image type"""
         image_type = self.detect_image_type(image)
-        
         if image_type == 'bscan':
             return self.preprocess_bscan_image(image)
         else:
             return self.preprocess_fundus_image(image)
-    
+
+    # ============================================================
+    # BRIGHT REGION DETECTION
+    # ============================================================
+
     def find_bright_regions_fundus(self, image):
-        """Find bright regions in fundus images"""
         mean_val = np.mean(image)
         std_val = np.std(image)
-        
         methods = []
-        
+
         thresh1 = min(mean_val + 2 * std_val, 255)
         _, binary1 = cv2.threshold(image, thresh1, 255, cv2.THRESH_BINARY)
         methods.append(("Statistical", binary1, thresh1))
-        
+
         thresh2 = np.percentile(image, 98)
         _, binary2 = cv2.threshold(image, thresh2, 255, cv2.THRESH_BINARY)
         methods.append(("98th Percentile", binary2, thresh2))
-        
+
         thresh3, binary3 = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         methods.append(("Otsu", binary3, thresh3))
-        
-        binary4 = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                       cv2.THRESH_BINARY, 11, 2)
+
+        binary4 = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY, 11, 2)
         methods.append(("Adaptive", binary4, 0))
-        
+
         return methods
-    
+
     def find_bright_regions_bscan(self, image):
-        """Find bright regions in B-scan images (optic nerve head appears as bright vertical structure)"""
         mean_val = np.mean(image)
         std_val = np.std(image)
-        
         methods = []
-        
-    
+
         thresh1 = min(mean_val + 1.5 * std_val, 255)
         _, binary1 = cv2.threshold(image, thresh1, 255, cv2.THRESH_BINARY)
         methods.append(("B-scan Statistical", binary1, thresh1))
-        
-     
+
         thresh2 = np.percentile(image, 95)
         _, binary2 = cv2.threshold(image, thresh2, 255, cv2.THRESH_BINARY)
         methods.append(("95th Percentile", binary2, thresh2))
-        
+
         thresh3, binary3 = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         methods.append(("Otsu B-scan", binary3, thresh3))
-        
-      
-        binary4 = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                       cv2.THRESH_BINARY, 21, 2)
+
+        binary4 = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY, 21, 2)
         methods.append(("Adaptive B-scan", binary4, 0))
-        
-  
+
         thresh5 = mean_val + 0.8 * std_val
         _, binary5 = cv2.threshold(image, thresh5, 255, cv2.THRESH_BINARY)
         methods.append(("B-scan Custom", binary5, thresh5))
-        
+
         if self.debug:
             print(f"B-scan image stats: mean={mean_val:.1f}, std={std_val:.1f}")
             for name, _, thresh in methods:
                 if thresh > 0:
-                    print(f"{name} threshold: {thresh:.1f}")
-        
+                    print(f"  {name} threshold: {thresh:.1f}")
+
         return methods
-    
+
     def find_bright_regions(self, image):
-        """Adaptive bright region detection based on image type"""
         if self.image_type == 'bscan':
             return self.find_bright_regions_bscan(image)
         else:
             return self.find_bright_regions_fundus(image)
-    
+
+    # ============================================================
+    # CONTOUR ANALYSIS
+    # ============================================================
+
     def analyze_contour_fundus(self, contour, original_image):
-        """Analyze contour for fundus images (circular optic disc)"""
         area = cv2.contourArea(contour)
         perimeter = cv2.arcLength(contour, True)
-        
+
         if area < 100 or perimeter == 0:
             return None
-        
+
         circularity = 4 * np.pi * area / (perimeter * perimeter)
         x, y, w, h = cv2.boundingRect(contour)
         aspect_ratio = float(w) / h
-        
+
         (center_x, center_y), radius = cv2.minEnclosingCircle(contour)
         center = (int(center_x), int(center_y))
-        
+
         mask = np.zeros(original_image.shape, dtype=np.uint8)
         cv2.fillPoly(mask, [contour], 255)
         mean_intensity = cv2.mean(original_image, mask=mask)[0]
-        
+
         hull = cv2.convexHull(contour)
         hull_area = cv2.contourArea(hull)
         solidity = area / hull_area if hull_area > 0 else 0
-        
+
         return {
             'contour': contour,
             'center': center,
@@ -179,36 +237,33 @@ class OpticDiscDetector:
             'height': h,
             'width': w
         }
-    
+
     def analyze_contour_bscan(self, contour, original_image):
-        """Analyze contour for B-scan images (vertical nerve head structure)"""
         area = cv2.contourArea(contour)
         perimeter = cv2.arcLength(contour, True)
-        
-        if area < 50 or perimeter == 0:  # Lower threshold for B-scans
+
+        if area < 50 or perimeter == 0:
             return None
-        
+
         x, y, w, h = cv2.boundingRect(contour)
-        aspect_ratio = float(h) / w  # Height/width for vertical structures
-        
-      
-        if aspect_ratio < 0.8:  # Should be taller than wide
+        # aspect_ratio here is height/width — nerve head is tall, not wide
+        aspect_ratio = float(h) / max(w, 1)
+
+        # Accept both tall structures (h>w) and roughly square — the key
+        # filter is applied in filter_candidates_bscan, not here.
+        if aspect_ratio < 0.5:
             return None
-        
-        center = (int(x + w/2), int(y + h/2))
-        
+
+        center = (int(x + w / 2), int(y + h / 2))
+
         mask = np.zeros(original_image.shape, dtype=np.uint8)
         cv2.fillPoly(mask, [contour], 255)
         mean_intensity = cv2.mean(original_image, mask=mask)[0]
-        
+
         hull = cv2.convexHull(contour)
         hull_area = cv2.contourArea(hull)
         solidity = area / hull_area if hull_area > 0 else 0
-        
-        
-        nerve_height = h
-        nerve_width = w
-        
+
         return {
             'contour': contour,
             'center': center,
@@ -218,26 +273,28 @@ class OpticDiscDetector:
             'intensity': mean_intensity,
             'solidity': solidity,
             'bbox': (x, y, w, h),
-            'height': nerve_height,
-            'width': nerve_width,
-            'nerve_head_height': nerve_height  # measurments for b scan
+            'height': h,
+            'width': w,
+            'nerve_head_height': h
         }
-    
+
     def analyze_contour(self, contour, original_image):
-        """Adaptive contour analysis based on image type"""
         if self.image_type == 'bscan':
             return self.analyze_contour_bscan(contour, original_image)
         else:
             return self.analyze_contour_fundus(contour, original_image)
-    
+
+    # ============================================================
+    # CANDIDATE FILTERING & SCORING
+    # ============================================================
+
     def filter_candidates_fundus(self, candidates, image_shape):
-        """Filter candidates for fundus images"""
         if not candidates:
             return []
-        
+
         h, w = image_shape
         filtered = []
-        
+
         for candidate in candidates:
             if 300 < candidate['area'] < 10000:
                 if candidate['circularity'] > 0.2:
@@ -245,416 +302,1168 @@ class OpticDiscDetector:
                         if candidate['solidity'] > 0.7:
                             x, y = candidate['center']
                             margin = 50
-                            if (margin < x < w - margin and margin < y < h - margin):
+                            if margin < x < w - margin and margin < y < h - margin:
                                 filtered.append(candidate)
-        
+
         def score_candidate(cand):
             brightness_score = cand['intensity'] / 255.0
             shape_score = cand['circularity']
             size_score = min(cand['area'] / 3000.0, 1.0)
             return 0.5 * brightness_score + 0.3 * shape_score + 0.2 * size_score
-        
+
         filtered.sort(key=score_candidate, reverse=True)
         return filtered
-    
+
     def filter_candidates_bscan(self, candidates, image_shape):
-        """Filter candidates for B-scan images"""
         if not candidates:
             return []
-        
-        h, w = image_shape
+
+        img_h, img_w = image_shape
         filtered = []
-        
+
         for candidate in candidates:
-          
-            if 200 < candidate['area'] < 8000:  
-                if candidate['aspect_ratio'] > 1.2:
-                    if candidate['solidity'] > 0.6:  
-                        if candidate['height'] > 20:  
-                            x, y = candidate['center']
-                            margin = 30  # Smaller margin
-                            if (margin < x < w - margin and margin < y < h - margin):
-                                filtered.append(candidate)
-        
+            area = candidate['area']
+            h_cand = candidate['height']
+            w_cand = candidate['width']
+            cx, cy = candidate['center']
+
+            # Area range: broader than fundus — nerve head can be large in B-scans
+            if not (100 < area < 50000):
+                continue
+            # Must have some vertical extent
+            if h_cand < 15:
+                continue
+            # Must not be a horizontal sliver (e.g. the globe wall itself)
+            if candidate['aspect_ratio'] < 0.4:
+                continue
+            # Must not hug the very edge
+            margin = 20
+            if not (margin < cx < img_w - margin and margin < cy < img_h - margin):
+                continue
+            # Exclude structures that span > 60 % of image width (globe wall artefacts)
+            if w_cand > img_w * 0.60:
+                continue
+
+            filtered.append(candidate)
+
         def score_bscan_candidate(cand):
             brightness_score = cand['intensity'] / 255.0
-            vertical_score = min(cand['aspect_ratio'] / 3.0, 1.0)  # Favor vertical structures
-            size_score = min(cand['area'] / 2000.0, 1.0)
-            height_score = min(cand['height'] / 100.0, 1.0)  # Favor taller structures
-            return 0.4 * brightness_score + 0.2 * vertical_score + 0.2 * size_score + 0.2 * height_score
-        
+            # Reward tall, compact structures — favour height over raw area
+            height_score  = min(cand['height'] / (img_h * 0.5), 1.0)
+            vertical_score = min(cand['aspect_ratio'] / 2.0, 1.0)
+            solidity_score = cand['solidity']
+            return (0.40 * brightness_score
+                    + 0.25 * height_score
+                    + 0.20 * vertical_score
+                    + 0.15 * solidity_score)
+
         filtered.sort(key=score_bscan_candidate, reverse=True)
         return filtered
-    
+
     def filter_candidates(self, candidates, image_shape):
-        """Adaptive candidate filtering based on image type"""
         if self.image_type == 'bscan':
             return self.filter_candidates_bscan(candidates, image_shape)
         else:
             return self.filter_candidates_fundus(candidates, image_shape)
-    
+
+    # ============================================================
+    # OPTIC NERVE SHEATH DIAMETER (ONSD)
+    # ============================================================
+
+    @staticmethod
+    def _gaussian_smooth_1d(arr, sigma=3):
+        """Lightweight 1D Gaussian smoothing via convolution (no scipy needed)"""
+        kernel_size = int(6 * sigma + 1) | 1  # ensure odd
+        x = np.arange(kernel_size) - kernel_size // 2
+        kernel = np.exp(-0.5 * (x / sigma) ** 2)
+        kernel /= kernel.sum()
+        return np.convolve(arr.astype(float), kernel, mode='same')
+
+    def measure_onsd(self, image, nerve_candidate):
+        """
+        Measure Optic Nerve Sheath Diameter (ONSD).
+
+        B-scan: scan horizontal profiles through the nerve centre and detect
+        the full width of the echogenic nerve-plus-sheath complex using a
+        40% above-background threshold (FWHM-style crossing).
+
+        Fundus: ONSD cannot be seen directly; returns an anatomical estimate
+        derived from the optic disc diameter (ODD × 1.4, based on the known
+        anatomical ratio between disc diameter and nerve sheath width).
+
+        Units: pixels.  Divide by self.pixels_per_mm for mm, if calibrated.
+        """
+        if self.image_type == 'bscan':
+            return self._measure_onsd_bscan(image, nerve_candidate)
+        else:
+            return self._measure_onsd_fundus(nerve_candidate)
+
+    def _measure_onsd_bscan(self, image, nerve_candidate):
+        bbox = nerve_candidate['bbox']
+        x, w, h = bbox[0], bbox[2], bbox[3]
+        cy = nerve_candidate['center'][1]
+        img_h, img_w = image.shape
+
+        # Sample three rows: slightly above centre, centre, slightly below
+        sample_rows = [
+            max(0, int(cy - h * 0.1)),
+            max(0, cy),
+            min(img_h - 1, int(cy + h * 0.1))
+        ]
+
+        widths = []
+        for row in sample_rows:
+            search_left = max(0, x - w)
+            search_right = min(img_w, x + 2 * w)
+            profile = image[row, search_left:search_right].astype(float)
+            if len(profile) < 10:
+                continue
+
+            profile_smooth = self._gaussian_smooth_1d(profile, sigma=3)
+            bg_left = float(np.median(profile_smooth[:max(1, len(profile_smooth) // 5)]))
+            bg_right = float(np.median(profile_smooth[max(1, 4 * len(profile_smooth) // 5):]))
+            background = (bg_left + bg_right) / 2.0
+            peak = float(np.max(profile_smooth))
+
+            if peak <= background + 5:
+                continue
+
+            threshold = background + 0.40 * (peak - background)
+            above = profile_smooth > threshold
+            if not np.any(above):
+                continue
+
+            indices = np.where(above)[0]
+            width_px = int(indices[-1] - indices[0])
+            if width_px > 5:
+                widths.append(width_px)
+
+        if widths:
+            onsd = float(np.median(widths))
+        else:
+            # Fallback: bounding-box width + estimated sheath margin (15 % each side)
+            onsd = float(w) * 1.30
+
+        if self.debug:
+            print(f"ONSD (B-scan): {onsd:.1f} px"
+                  + (f"  /  {onsd / self.pixels_per_mm:.2f} mm" if self.pixels_per_mm else ""))
+        return onsd
+
+    def _measure_onsd_fundus(self, nerve_candidate):
+        disc_diameter = nerve_candidate['radius'] * 2
+        onsd = disc_diameter * 1.4
+        if self.debug:
+            print(f"ONSD (fundus estimate): {onsd:.1f} px")
+        return float(onsd)
+
+    # ============================================================
+    # POSTERIOR GLOBE — CROSS-SECTIONAL AREA & RADIUS OF CURVATURE
+    # ============================================================
+
+    def measure_posterior_globe(self, image, nerve_candidate=None):  # noqa: ARG002
+        """
+        Detect the posterior globe outline and return:
+          - globe_center       : (x, y) in pixels
+          - globe_radius       : best-fit circle radius in pixels
+          - cross_sectional_area : π r²  in pixels²
+          - radius_of_curvature  : same as globe_radius (posterior surface curvature)
+          - method             : detection strategy used
+
+        B-scan: Hough circle on the blurred image; the largest detected circle is
+        the globe wall.  Falls back to an image-height-based estimate.
+
+        Fundus: Hough circle on the illuminated field boundary (the circular
+        bright area that bounds a fundus image).  Falls back to min(h, w)/2.
+        """
+        if self.image_type == 'bscan':
+            return self._measure_globe_bscan(image)
+        else:
+            return self._measure_globe_fundus(image)
+
+    def _measure_globe_bscan(self, image):
+        img_h, img_w = image.shape
+        blurred = cv2.GaussianBlur(image, (9, 9), 2)
+
+        circles = cv2.HoughCircles(
+            blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=1,
+            minDist=img_h // 3,
+            param1=50,
+            param2=30,
+            minRadius=img_h // 6,
+            maxRadius=min(img_h, img_w) // 2
+        )
+
+        if circles is not None:
+            circles = np.round(circles[0]).astype(int)
+            # Largest circle = globe
+            cx, cy, r = sorted(circles, key=lambda c: c[2], reverse=True)[0]
+            area = np.pi * r ** 2
+            if self.debug:
+                print(f"Posterior globe (Hough): center=({cx},{cy}), r={r}px, area={area:.0f}px²")
+            return {
+                'globe_center': (int(cx), int(cy)),
+                'globe_radius': float(r),
+                'cross_sectional_area': float(area),
+                'radius_of_curvature': float(r),
+                'method': 'hough_circle'
+            }
+
+        # Fallback: globe typically spans ~70 % of image height
+        r = img_h * 0.35
+        area = np.pi * r ** 2
+        if self.debug:
+            print(f"Posterior globe (fallback estimate): r={r:.1f}px")
+        return {
+            'globe_center': (img_w // 2, img_h // 2),
+            'globe_radius': r,
+            'cross_sectional_area': float(area),
+            'radius_of_curvature': r,
+            'method': 'estimated'
+        }
+
+    def _measure_globe_fundus(self, image):
+        img_h, img_w = image.shape
+        # Fundus images have a circular bright field on a dark background
+        _, thresh = cv2.threshold(image, 10, 255, cv2.THRESH_BINARY)
+
+        circles = cv2.HoughCircles(
+            thresh,
+            cv2.HOUGH_GRADIENT,
+            dp=2,
+            minDist=min(img_h, img_w) // 2,
+            param1=50,
+            param2=30,
+            minRadius=min(img_h, img_w) // 4,
+            maxRadius=min(img_h, img_w) // 2
+        )
+
+        if circles is not None:
+            circles = np.round(circles[0]).astype(int)
+            cx, cy, r = sorted(circles, key=lambda c: c[2], reverse=True)[0]
+        else:
+            r = min(img_h, img_w) // 2
+            cx, cy = img_w // 2, img_h // 2
+
+        area = np.pi * r ** 2
+        if self.debug:
+            print(f"Posterior globe (fundus FOV): r={r}px, area={area:.0f}px²")
+        return {
+            'globe_center': (int(cx), int(cy)),
+            'globe_radius': float(r),
+            'cross_sectional_area': float(area),
+            'radius_of_curvature': float(r),
+            'method': 'fundus_fov'
+        }
+
+    # ============================================================
+    # VESSEL DETECTION (for fundus images)
+    # ============================================================
+
+    def enhance_vessels(self, image):
+        """
+        Enhance dark retinal vessels via multi-scale morphological black-hat
+        transform followed by CLAHE.  Vessels appear dark against the bright
+        fundus background, so black-hat extracts dark details.
+        """
+        vessel_enhanced = np.zeros(image.shape, dtype=float)
+        for ks in [3, 5, 7, 9]:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+            blackhat = cv2.morphologyEx(image, cv2.MORPH_BLACKHAT, kernel)
+            vessel_enhanced += blackhat.astype(float)
+
+        vessel_enhanced /= 4.0
+        vessel_enhanced = np.clip(vessel_enhanced, 0, 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return clahe.apply(vessel_enhanced)
+
+    def detect_vessels(self, image):
+        """
+        Segment retinal vessels.
+        Returns (vessel_mask [uint8 binary], vessel_enhanced [uint8]).
+        """
+        enhanced = self.enhance_vessels(image)
+        mean_val = np.mean(enhanced)
+        std_val = np.std(enhanced)
+        thresh_val = min(mean_val + 1.0 * std_val, 200)
+        _, vessel_mask = cv2.threshold(enhanced, thresh_val, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        vessel_mask = cv2.morphologyEx(vessel_mask, cv2.MORPH_OPEN, kernel)
+        return vessel_mask, enhanced
+
+    # ============================================================
+    # CRAE / CRVE / AVR
+    # ============================================================
+
+    @staticmethod
+    def _knudtson_combine(diameters, coeff):
+        """
+        Iterative Knudtson vessel-equivalent formula:
+            W_new = coeff * sqrt(d_larger² + d_smaller²)
+        Pairs are sorted largest-first; odd remainders carry forward unchanged.
+        """
+        d = sorted(diameters, reverse=True)
+        while len(d) > 1:
+            new_d = []
+            for i in range(0, len(d) - 1, 2):
+                new_d.append(coeff * np.sqrt(d[i] ** 2 + d[i + 1] ** 2))
+            if len(d) % 2 == 1:
+                new_d.append(d[-1])
+            d = sorted(new_d, reverse=True)
+        return float(d[0])
+
+    def _measure_vessel_calibers_in_zone(self, vessel_mask, disc_center, disc_radius, image):
+        """
+        Measure vessel calibers inside the peripapillary annulus
+        (0.5 × disc_radius  to  1.5 × disc_radius from the disc centre).
+
+        Each connected component in the annular zone gets an estimated caliber:
+            caliber ≈ component_area / max(component_width, component_height)
+
+        Vessels are split into arteries (above-median intensity → brighter)
+        and veins (below-median intensity → darker).
+        """
+        img_h, img_w = vessel_mask.shape
+        cx, cy = disc_center
+        inner_r = int(disc_radius * 0.5)
+        outer_r = int(disc_radius * 1.5)
+
+        yy, xx = np.ogrid[:img_h, :img_w]
+        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        annular = ((dist >= inner_r) & (dist <= outer_r)).astype(np.uint8) * 255
+        zone_vessels = cv2.bitwise_and(vessel_mask, annular)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(zone_vessels)
+
+        vessel_data = []
+        for i in range(1, num_labels):
+            comp_area = stats[i, cv2.CC_STAT_AREA]
+            if comp_area < 10:
+                continue
+            comp_w = max(stats[i, cv2.CC_STAT_WIDTH], 1)
+            comp_h = max(stats[i, cv2.CC_STAT_HEIGHT], 1)
+            caliber = comp_area / float(max(comp_w, comp_h))
+            if caliber < 2:
+                continue
+            comp_mask = (labels == i).astype(np.uint8) * 255
+            mean_int = cv2.mean(image, mask=comp_mask)[0]
+            vessel_data.append((caliber, mean_int))
+
+        if not vessel_data:
+            return [], []
+
+        # Take the 12 largest caliber vessels for the formula
+        vessel_data.sort(key=lambda v: v[0], reverse=True)
+        top = vessel_data[:12]
+
+        intensities = [v[1] for v in top]
+        median_int = float(np.median(intensities))
+
+        arteries = [c for c, intv in top if intv >= median_int]
+        veins    = [c for c, intv in top if intv < median_int]
+
+        return arteries, veins
+
+    def calculate_vascular_metrics(self, image, disc_center, disc_radius):
+        """
+        Compute CRAE, CRVE, and AVR for a fundus image.
+
+        CRAE (Central Retinal Arteriole Equivalent): Knudtson coeff = 0.88
+        CRVE (Central Retinal Venule Equivalent):    Knudtson coeff = 0.95
+        AVR  (Arteriove nous Ratio):                 CRAE / CRVE
+            Normal range: 0.67–0.75.  Values < 0.67 suggest arteriolar narrowing.
+
+        All values in pixels; divide by self.pixels_per_mm for mm.
+        """
+        vessel_mask, _ = self.detect_vessels(image)
+        arteries, veins = self._measure_vessel_calibers_in_zone(
+            vessel_mask, disc_center, disc_radius, image
+        )
+
+        crae = self._knudtson_combine(arteries, 0.88) if len(arteries) >= 2 else (arteries[0] if arteries else None)
+        crve = self._knudtson_combine(veins,    0.95) if len(veins)    >= 2 else (veins[0]    if veins    else None)
+        avr  = (crae / crve) if (crae and crve and crve > 0) else None
+
+        if self.debug:
+            print(f"Artery calibers ({len(arteries)}): {[f'{c:.1f}' for c in arteries]}")
+            print(f"Vein   calibers ({len(veins)}):   {[f'{c:.1f}' for c in veins]}")
+            print(f"CRAE: {crae:.2f} px" if crae else "CRAE: N/A")
+            print(f"CRVE: {crve:.2f} px" if crve else "CRVE: N/A")
+            print(f"AVR : {avr:.3f}"     if avr  else "AVR : N/A")
+
+        return {
+            'crae': crae,
+            'crve': crve,
+            'avr': avr,
+            'artery_calibers': arteries,
+            'vein_calibers': veins,
+            'vessel_mask': vessel_mask
+        }
+
+    # ============================================================
+    # MAIN DETECTION
+    # ============================================================
+
     def detect_optic_disc(self, image_path):
-        """Main detection function with B-scan support"""
+        """
+        Main detection pipeline.
+
+        Returns
+        -------
+        candidates : list of dicts, sorted best-first
+        original   : grayscale ndarray
+        processed  : preprocessed grayscale ndarray
+        measurements : dict with keys:
+            optic_disc_radius      (fundus only, px)
+            nerve_head_height      (B-scan only, px)
+            nerve_head_width       (B-scan only, px)
+            onsd                   (px)
+            posterior_globe        (dict with globe_center, globe_radius, …)
+            posterior_globe_area   (px²)
+            radius_of_curvature    (px)
+            crae                   (px, fundus only)
+            crve                   (px, fundus only)
+            avr                    (dimensionless, fundus only)
+            vessel_mask            (ndarray, fundus only)
+        """
         image = self.load_image(image_path)
-        processed = self.preprocess_image(image)  #auto ditects image type fingers crossed
-        
+        processed = self.preprocess_image(image)
+
         if self.debug:
             print(f"\nProcessing: {os.path.basename(image_path)}")
             print(f"Image type: {self.image_type}")
             print(f"Image shape: {image.shape}")
-            print(f"Intensity range: {image.min()} - {image.max()}")
-        
+            print(f"Intensity range: {image.min()} – {image.max()}")
+
         threshold_methods = self.find_bright_regions(processed)
         all_candidates = []
-        
-        for method_name, binary_mask, threshold_val in threshold_methods:
-            # changes operation based on image type
+
+        for method_name, binary_mask, _ in threshold_methods:
             if self.image_type == 'bscan':
-                # make sure it does not lose the kernal structure
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 5))  # Vertical kernal
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 5))
             else:
-                # Circular structures for fundus
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            
+
             cleaned = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
             cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
-            
+
             contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
             if self.debug:
-                print(f"{method_name}: {len(contours)} contours found")
-            
+                print(f"  {method_name}: {len(contours)} contours")
+
             for contour in contours:
                 candidate = self.analyze_contour(contour, image)
                 if candidate:
                     candidate['method'] = method_name
                     all_candidates.append(candidate)
-        
+
         good_candidates = self.filter_candidates(all_candidates, image.shape)
-        
+
         if self.debug:
-            print(f"Found {len(good_candidates)} good candidates after filtering")
+            print(f"Good candidates: {len(good_candidates)}")
             for i, cand in enumerate(good_candidates[:3]):
                 if self.image_type == 'bscan':
-                    print(f"  {i+1}. Center: {cand['center']}, Height: {cand['height']}, "
-                          f"Width: {cand['width']}, Intensity: {cand['intensity']:.1f}")
+                    print(f"  {i+1}. center={cand['center']}, h={cand['height']}, "
+                          f"w={cand['width']}, intensity={cand['intensity']:.1f}")
                 else:
-                    print(f"  {i+1}. Center: {cand['center']}, Radius: {cand.get('radius', 'N/A')}, "
-                          f"Intensity: {cand['intensity']:.1f}, Circularity: {cand.get('circularity', 'N/A'):.2f}")
-        
-        return good_candidates, image, processed
-    
-    def visualize_results(self, candidates, original_image, processed_image, save_path=None):
-        """Visualize detection results for both fundus and B-scan images"""
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        
-        # Original image
+                    print(f"  {i+1}. center={cand['center']}, radius={cand.get('radius','N/A')}, "
+                          f"intensity={cand['intensity']:.1f}, circ={cand.get('circularity',0):.2f}")
+
+        # ---- Extended measurements ----------------------------------------
+        measurements = {}
+
+        if good_candidates:
+            best = good_candidates[0]
+
+            # 1. Optic Nerve Sheath Diameter
+            onsd_px = self.measure_onsd(image, best)
+            measurements['onsd']    = onsd_px
+            measurements['onsd_mm'] = self.px_to_mm(onsd_px)
+
+            # 2. Posterior globe cross-sectional area & radius of curvature
+            globe = self.measure_posterior_globe(image, best)
+            measurements['posterior_globe']          = globe
+            measurements['posterior_globe_area']     = globe['cross_sectional_area']
+            measurements['posterior_globe_area_mm2'] = self.px2_to_mm2(globe['cross_sectional_area'])
+            measurements['radius_of_curvature']      = globe['radius_of_curvature']
+            measurements['radius_of_curvature_mm']   = self.px_to_mm(globe['radius_of_curvature'])
+
+            if self.image_type == 'fundus':
+                # 3a. Optic disc radius
+                disc_r = float(best.get('radius', 0))
+                measurements['optic_disc_radius']    = disc_r
+                measurements['optic_disc_radius_mm'] = self.px_to_mm(disc_r)
+
+                # 4. Vascular metrics (CRAE / CRVE / AVR)
+                vascular = self.calculate_vascular_metrics(
+                    image, best['center'], best.get('radius', 30)
+                )
+                measurements.update(vascular)
+                measurements['crae_mm'] = self.px_to_mm(vascular.get('crae'))
+                measurements['crve_mm'] = self.px_to_mm(vascular.get('crve'))
+                # AVR is dimensionless — no unit conversion needed
+            else:
+                # 3b. Nerve head dimensions
+                nh = best.get('height')
+                nw = best.get('width')
+                measurements['nerve_head_height']    = nh
+                measurements['nerve_head_height_mm'] = self.px_to_mm(nh)
+                measurements['nerve_head_width']     = nw
+                measurements['nerve_head_width_mm']  = self.px_to_mm(nw)
+
+        return good_candidates, image, processed, measurements
+
+    # ============================================================
+    # VISUALISATION
+    # ============================================================
+
+    def visualize_results(self, candidates, original_image, processed_image,
+                          measurements=None, save_path=None):
+        """
+        2×3 figure:
+          [0,0] Original          [0,1] Preprocessed      [0,2] Threshold view
+          [1,0] Detection overlay [1,1] Vessel map         [1,2] Measurements table
+        """
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
         axes[0, 0].imshow(original_image, cmap='gray')
         axes[0, 0].set_title(f'Original Image ({self.image_type.upper()})')
         axes[0, 0].axis('off')
-        
 
         axes[0, 1].imshow(processed_image, cmap='gray')
         axes[0, 1].set_title('Preprocessed Image')
         axes[0, 1].axis('off')
-        
-    
+
         result = cv2.cvtColor(original_image, cv2.COLOR_GRAY2BGR)
-        
+
         if candidates:
-            best_candidate = candidates[0]
-            center = best_candidate['center']
-            
+            best = candidates[0]
+            center = best['center']
+
             if self.image_type == 'bscan':
-                # boundry box
-                x, y, w, h = best_candidate['bbox']
+                x, y, w, h = best['bbox']
                 cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.circle(result, center, 3, (0, 0, 255), -1)
-                
-                # label with height 
-                height = best_candidate['height']
-                cv2.putText(result, "Nerve Head", 
-                           (center[0] - 40, center[1] - h//2 - 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(result, f"Height: {height}px", 
-                           (center[0] - 40, center[1] - h//2 - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                height = best['height']
+                cv2.putText(result, "Nerve Head",
+                            (center[0] - 40, max(5, center[1] - h // 2 - 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(result, f"H: {height}px",
+                            (center[0] - 40, max(5, center[1] - h // 2 - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+                # ONSD measurement line
+                if measurements and measurements.get('onsd'):
+                    onsd = measurements['onsd']
+                    half = int(onsd / 2)
+                    cv2.line(result,
+                             (center[0] - half, center[1]),
+                             (center[0] + half, center[1]),
+                             (0, 255, 255), 2)
+                    cv2.putText(result, f"ONSD: {onsd:.1f}px",
+                                (center[0] - half, max(5, center[1] - 12)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+                # Posterior globe circle
+                if measurements and measurements.get('posterior_globe'):
+                    globe = measurements['posterior_globe']
+                    gc = globe['globe_center']
+                    gr = int(globe['globe_radius'])
+                    cv2.circle(result, gc, gr, (255, 165, 0), 2)
+
             else:
-                #draw the circle 
-                radius = best_candidate.get('radius', 20)
+                radius = best.get('radius', 20)
                 cv2.circle(result, center, radius, (0, 255, 0), 3)
                 cv2.circle(result, center, 3, (0, 0, 255), -1)
-                cv2.drawContours(result, [best_candidate['contour']], -1, (0, 255, 0), 2)
-                
-                cv2.putText(result, "Optic Disc", 
-                           (center[0] - 40, center[1] - radius - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        title = f'Best Detection ({self.image_type.upper()})'
+                cv2.drawContours(result, [best['contour']], -1, (0, 255, 0), 2)
+                cv2.putText(result, "Optic Disc",
+                            (center[0] - 40, max(5, center[1] - radius - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                if measurements and measurements.get('onsd'):
+                    onsd = measurements['onsd']
+                    cv2.putText(result, f"Est. ONSD: {onsd:.1f}px",
+                                (center[0] - 60, center[1] + radius + 22),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+                # Overlay vessel map in magenta
+                if measurements and measurements.get('vessel_mask') is not None:
+                    vm = measurements['vessel_mask']
+                    result[vm > 0] = [200, 0, 180]
+
+                # Posterior globe boundary
+                if measurements and measurements.get('posterior_globe'):
+                    globe = measurements['posterior_globe']
+                    gc = globe['globe_center']
+                    gr = int(globe['globe_radius'])
+                    cv2.circle(result, gc, gr, (255, 165, 0), 2)
+
         axes[1, 0].imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-        axes[1, 0].set_title(title)
+        axes[1, 0].set_title(f'Detection ({self.image_type.upper()})')
         axes[1, 0].axis('off')
-        
-        # visulize the image :)
+
+        # Threshold visualisation
         if candidates:
-            if self.image_type == 'bscan':
-                thresh_val = np.percentile(processed_image, 95)
-            else:
-                thresh_val = np.percentile(processed_image, 98)
-            _, thresh_img = cv2.threshold(processed_image, thresh_val, 255, cv2.THRESH_BINARY)
-            
-            axes[1, 1].imshow(thresh_img, cmap='gray')
-            axes[1, 1].set_title('Threshold Visualization')
-            axes[1, 1].axis('off')
+            pct = 95 if self.image_type == 'bscan' else 98
+            tv = np.percentile(processed_image, pct)
+            _, thresh_img = cv2.threshold(processed_image, tv, 255, cv2.THRESH_BINARY)
+            axes[0, 2].imshow(thresh_img, cmap='gray')
+            axes[0, 2].set_title('Threshold View')
         else:
-            axes[1, 1].text(0.5, 0.5, 'No Detection', transform=axes[1, 1].transAxes,
-                           ha='center', va='center', fontsize=16)
-            axes[1, 1].axis('off')
-        
+            axes[0, 2].text(0.5, 0.5, 'No Detection', transform=axes[0, 2].transAxes,
+                            ha='center', va='center', fontsize=16, color='red')
+        axes[0, 2].axis('off')
+
+        # Vessel map panel (fundus) or plain image (B-scan)
+        if (self.image_type == 'fundus'
+                and measurements
+                and measurements.get('vessel_mask') is not None):
+            axes[1, 1].imshow(measurements['vessel_mask'], cmap='hot')
+            axes[1, 1].set_title('Vessel Segmentation Map')
+        else:
+            axes[1, 1].imshow(original_image, cmap='gray')
+            axes[1, 1].set_title('Original (no vessel map)')
+        axes[1, 1].axis('off')
+
+        # Measurements text panel
+        axes[1, 2].axis('off')
+        if measurements:
+            ppm = self._ppm
+
+            def fmt(px_val, mm_val, unit='mm', dp_mm=2):
+                if px_val is None:
+                    return "N/A"
+                mm_s = f"{mm_val:.{dp_mm}f} {unit}" if mm_val is not None else "? mm"
+                return f"{px_val:.1f} px  ({mm_s})"
+
+            def fmt_area(px2_val, mm2_val):
+                if px2_val is None:
+                    return "N/A"
+                mm2_s = f"{mm2_val:.2f} mm²" if mm2_val is not None else "? mm²"
+                return f"{px2_val:.0f} px²  ({mm2_s})"
+
+            cal_src = "user" if self.pixels_per_mm else ("B-scan default" if self.image_type == 'bscan' else "fundus default")
+            lines = [
+                "MEASUREMENTS",
+                "=" * 36,
+                f"Scale: {ppm:.1f} px/mm  [{cal_src}]",
+                "",
+            ]
+
+            if self.image_type == 'fundus':
+                lines.append(f"Optic Disc Radius  : {fmt(measurements.get('optic_disc_radius'), measurements.get('optic_disc_radius_mm'))}")
+            else:
+                lines.append(f"Nerve Head Height  : {fmt(measurements.get('nerve_head_height'), measurements.get('nerve_head_height_mm'))}")
+                lines.append(f"Nerve Head Width   : {fmt(measurements.get('nerve_head_width'), measurements.get('nerve_head_width_mm'))}")
+
+            lines.append("")
+            lines.append(f"ONSD               : {fmt(measurements.get('onsd'), measurements.get('onsd_mm'))}")
+            lines.append(f"Post. Globe Area   : {fmt_area(measurements.get('posterior_globe_area'), measurements.get('posterior_globe_area_mm2'))}")
+            lines.append(f"Radius of Curv.    : {fmt(measurements.get('radius_of_curvature'), measurements.get('radius_of_curvature_mm'))}")
+
+            if self.image_type == 'fundus':
+                crae = measurements.get('crae')
+                crve = measurements.get('crve')
+                avr  = measurements.get('avr')
+                lines.append("")
+                lines.append(f"CRAE               : {fmt(crae, measurements.get('crae_mm'))}")
+                lines.append(f"CRVE               : {fmt(crve, measurements.get('crve_mm'))}")
+                avr_s = f"{avr:.3f}" if avr else "N/A"
+                norm  = " (normal)" if avr and 0.67 <= avr <= 0.75 else \
+                        " (narrow)"  if avr and avr < 0.67 else \
+                        " (wide v.)" if avr else ""
+                lines.append(f"AVR                : {avr_s}{norm}")
+
+            axes[1, 2].text(0.05, 0.95, "\n".join(lines),
+                            transform=axes[1, 2].transAxes,
+                            fontsize=9, verticalalignment='top',
+                            fontfamily='monospace',
+                            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        axes[1, 2].set_title('Measurements')
+
         plt.tight_layout()
-        
+
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             cv2.imwrite(save_path.replace('.png', '_result.png'), result)
-        
+
         plt.show()
-        
         return result
 
-def process_all_images():
-    """Process all images with B-scan support"""
-    detector = OpticDiscDetector()
-    
-    # lets it use mutliple points of inpt
-    input_dir = "/Users/williambaranano/Downloads/osv images/DR1-additional-marked-images"
-    
+
+# ================================================================
+# BATCH PROCESSING
+# ================================================================
+
+def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
+    """
+    Process all images in input_dir and save per-image PNG results + a CSV
+    summary to output_dir.
+
+    Parameters
+    ----------
+    input_dir     : path to folder containing images (prompted if None)
+    output_dir    : path to write results (auto-created if needed; defaults to
+                    a subfolder inside input_dir)
+    pixels_per_mm : override scale factor; None = use per-type defaults
+    """
+    detector = OpticDiscDetector(pixels_per_mm=pixels_per_mm)
+
+    if input_dir is None:
+        input_dir = os.environ.get(
+            'OPTIC_INPUT_DIR',
+            os.path.join(os.path.dirname(__file__), 'images')
+        )
+
     if not os.path.exists(input_dir):
         print(f"Input directory not found: {input_dir}")
         return
-    
-    # Look for multiple formats, :/
+
     image_files = []
     for ext in ['.pgm', '.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp']:
-        image_files.extend([f for f in os.listdir(input_dir) if f.lower().endswith(ext)])
-    
+        image_files.extend(
+            [f for f in os.listdir(input_dir) if f.lower().endswith(ext)]
+        )
+
     if not image_files:
         print("No image files found in the directory")
         return
-    
+
+    if output_dir is None:
+        output_dir = os.path.join(os.path.dirname(__file__), 'optic_disc_results')
+
+    os.makedirs(output_dir, exist_ok=True)
+
     print(f"Found {len(image_files)} images to process")
-    print(f"Processing all images in: {input_dir}")
+    print(f"Input : {input_dir}")
+    print(f"Output: {output_dir}")
     print("-" * 60)
-    
-    successful_detections = 0
-    failed_detections = 0
+
+    successful = 0
+    failed = 0
     results_summary = []
     fundus_count = 0
     bscan_count = 0
-    
+
     for i, filename in enumerate(image_files, 1):
         image_path = os.path.join(input_dir, filename)
-        
-        print(f"\n[{i}/{len(image_files)}] Processing: {filename}")
-        
+        print(f"\n[{i}/{len(image_files)}] {filename}")
+
         try:
-            candidates, original, processed = detector.detect_optic_disc(image_path)
-            
-            output_dir = "/Users/williambaranano/Desktop/python/optic_disc_results"
-            os.makedirs(output_dir, exist_ok=True)
-            
-            base_filename = os.path.splitext(filename)[0]
-            save_path = os.path.join(output_dir, f"{base_filename}_detection.png")
-            
-           
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            
+            candidates, original, processed, measurements = detector.detect_optic_disc(image_path)
+
+            base = os.path.splitext(filename)[0]
+            save_path = os.path.join(output_dir, f"{base}_detection.png")
+
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
             axes[0, 0].imshow(original, cmap='gray')
             axes[0, 0].set_title(f'Original ({detector.image_type.upper()})')
             axes[0, 0].axis('off')
-            
             axes[0, 1].imshow(processed, cmap='gray')
-            axes[0, 1].set_title('Preprocessed Image')
+            axes[0, 1].set_title('Preprocessed')
             axes[0, 1].axis('off')
-            
+
             result = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
-            
+
             if candidates:
-                best_candidate = candidates[0]
-                center = best_candidate['center']
-                
+                best = candidates[0]
+                center = best['center']
+
                 if detector.image_type == 'bscan':
                     bscan_count += 1
-                    x, y, w, h = best_candidate['bbox']
+                    x, y, w, h = best['bbox']
                     cv2.rectangle(result, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     cv2.circle(result, center, 3, (0, 0, 255), -1)
-                    
-                    height = best_candidate['height']
-                    cv2.putText(result, "Nerve Head", 
-                               (center[0] - 40, center[1] - h//2 - 20),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(result, f"Height: {height}px", 
-                               (center[0] - 40, center[1] - h//2 - 5),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-                    
-                    measurement_type = "nerve_head_height"
-                    measurement_value = height
+                    cv2.putText(result, f"H:{best['height']}px",
+                                (center[0] - 30, max(5, center[1] - h // 2 - 5)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                    if measurements.get('onsd'):
+                        half = int(measurements['onsd'] / 2)
+                        cv2.line(result,
+                                 (center[0] - half, center[1]),
+                                 (center[0] + half, center[1]),
+                                 (0, 255, 255), 2)
+                    if measurements.get('posterior_globe'):
+                        gc = measurements['posterior_globe']['globe_center']
+                        gr = int(measurements['posterior_globe']['globe_radius'])
+                        cv2.circle(result, gc, gr, (255, 165, 0), 2)
                 else:
                     fundus_count += 1
-                    radius = best_candidate.get('radius', 20)
+                    radius = best.get('radius', 20)
                     cv2.circle(result, center, radius, (0, 255, 0), 3)
                     cv2.circle(result, center, 3, (0, 0, 255), -1)
-                    cv2.drawContours(result, [best_candidate['contour']], -1, (0, 255, 0), 2)
-                    
-                    cv2.putText(result, "Optic Disc", 
-                               (center[0] - 40, center[1] - radius - 10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    
-                    measurement_type = "optic_disc_radius"
-                    measurement_value = radius
-                
+                    cv2.drawContours(result, [best['contour']], -1, (0, 255, 0), 2)
+                    if measurements.get('vessel_mask') is not None:
+                        result[measurements['vessel_mask'] > 0] = [200, 0, 180]
+                    if measurements.get('posterior_globe'):
+                        gc = measurements['posterior_globe']['globe_center']
+                        gr = int(measurements['posterior_globe']['globe_radius'])
+                        cv2.circle(result, gc, gr, (255, 165, 0), 2)
+
                 axes[1, 0].imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-                axes[1, 0].set_title(f'Best Detection ({detector.image_type.upper()})')
+                axes[1, 0].set_title(f'Detection ({detector.image_type.upper()})')
                 axes[1, 0].axis('off')
-                
-                thresh_val = np.percentile(processed, 95 if detector.image_type == 'bscan' else 98)
-                _, thresh_img = cv2.threshold(processed, thresh_val, 255, cv2.THRESH_BINARY)
-                axes[1, 1].imshow(thresh_img, cmap='gray')
-                axes[1, 1].set_title('Threshold Visualization')
+
+                pct = 95 if detector.image_type == 'bscan' else 98
+                tv = np.percentile(processed, pct)
+                _, thresh_img = cv2.threshold(processed, tv, 255, cv2.THRESH_BINARY)
+                axes[0, 2].imshow(thresh_img, cmap='gray')
+                axes[0, 2].set_title('Threshold View')
+                axes[0, 2].axis('off')
+
+                if (detector.image_type == 'fundus'
+                        and measurements.get('vessel_mask') is not None):
+                    axes[1, 1].imshow(measurements['vessel_mask'], cmap='hot')
+                    axes[1, 1].set_title('Vessel Map')
+                else:
+                    axes[1, 1].imshow(original, cmap='gray')
+                    axes[1, 1].set_title('Image')
                 axes[1, 1].axis('off')
-                
-                successful_detections += 1
-                
+
+                # Measurements text — all values in mm
+                axes[1, 2].axis('off')
+
+                def _mm(val, dp=3):
+                    return f"{val:.{dp}f} mm" if val is not None else "N/A"
+
+                def _mm2(val, dp=2):
+                    return f"{val:.{dp}f} mm²" if val is not None else "N/A"
+
+                ppm = detector._ppm
+                cal_src = "user" if pixels_per_mm else (
+                    "B-scan default" if detector.image_type == 'bscan' else "fundus default"
+                )
+                lines = [
+                    "MEASUREMENTS",
+                    "=" * 30,
+                    f"Scale: {ppm:.1f} px/mm  [{cal_src}]",
+                    "",
+                ]
+                if detector.image_type == 'fundus':
+                    lines.append(f"Disc Radius : {_mm(measurements.get('optic_disc_radius_mm'))}")
+                else:
+                    lines.append(f"Nerve H     : {_mm(measurements.get('nerve_head_height_mm'))}")
+                    lines.append(f"Nerve W     : {_mm(measurements.get('nerve_head_width_mm'))}")
+                lines.append(f"ONSD        : {_mm(measurements.get('onsd_mm'))}")
+                lines.append(f"Globe Area  : {_mm2(measurements.get('posterior_globe_area_mm2'))}")
+                lines.append(f"RoC         : {_mm(measurements.get('radius_of_curvature_mm'))}")
+                if detector.image_type == 'fundus':
+                    avr = measurements.get('avr')
+                    lines.append(f"CRAE        : {_mm(measurements.get('crae_mm'), 4)}")
+                    lines.append(f"CRVE        : {_mm(measurements.get('crve_mm'), 4)}")
+                    avr_norm = (" (normal)" if avr and 0.67 <= avr <= 0.75 else
+                                " (narrow)"  if avr and avr < 0.67 else
+                                " (wide v.)" if avr else "")
+                    lines.append(f"AVR         : {f'{avr:.3f}{avr_norm}' if avr else 'N/A'}")
+                axes[1, 2].text(0.05, 0.95, "\n".join(lines),
+                                transform=axes[1, 2].transAxes,
+                                fontsize=9, verticalalignment='top',
+                                fontfamily='monospace',
+                                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                axes[1, 2].set_title('Measurements')
+
+                successful += 1
+                ppm = detector._ppm
                 results_summary.append({
                     'filename': filename,
                     'status': 'SUCCESS',
                     'image_type': detector.image_type,
-                    'center': best_candidate['center'],
-                    'intensity': best_candidate['intensity'],
-                    'area': best_candidate['area'],
-                    measurement_type: measurement_value,
-                    'height': best_candidate.get('height', 'N/A'),
-                    'width': best_candidate.get('width', 'N/A')
+                    'pixels_per_mm': ppm,
+                    'center_x': center[0],
+                    'center_y': center[1],
+                    'intensity': best['intensity'],
+                    'area': best['area'],
+                    'optic_disc_radius_mm': measurements.get('optic_disc_radius_mm', ''),
+                    'nerve_head_height_mm': measurements.get('nerve_head_height_mm', ''),
+                    'nerve_head_width_mm':  measurements.get('nerve_head_width_mm', ''),
+                    'onsd_mm': measurements.get('onsd_mm', ''),
+                    'posterior_globe_area_mm2': measurements.get('posterior_globe_area_mm2', ''),
+                    'radius_of_curvature_mm': measurements.get('radius_of_curvature_mm', ''),
+                    'crae_mm': measurements.get('crae_mm', ''),
+                    'crve_mm': measurements.get('crve_mm', ''),
+                    'avr': measurements.get('avr', ''),
                 })
-                
-                print(f"✓ DETECTED ({detector.image_type}) - Center: {center}, {measurement_type}: {measurement_value}")
-                
+                onsd = measurements.get('onsd_mm')
+                area = measurements.get('posterior_globe_area_mm2')
+                roc  = measurements.get('radius_of_curvature_mm')
+                print(f"  DETECTED ({detector.image_type})  [scale: {ppm:.1f} px/mm]")
+                print(f"    ONSD={onsd:.2f}mm  Globe={area:.2f}mm²  RoC={roc:.2f}mm" if all([onsd, area, roc]) else "")
+                if detector.image_type == 'fundus':
+                    crae = measurements.get('crae_mm')
+                    crve = measurements.get('crve_mm')
+                    avr  = measurements.get('avr')
+                    if crae and crve:
+                        print(f"    CRAE={crae:.3f}mm  CRVE={crve:.3f}mm  AVR={avr:.3f}" if avr else "")
+
             else:
-                axes[1, 0].text(0.5, 0.5, 'No Detection', transform=axes[1, 0].transAxes,
-                               ha='center', va='center', fontsize=16, color='red')
-                axes[1, 0].axis('off')
-                axes[1, 1].text(0.5, 0.5, 'No Detection', transform=axes[1, 1].transAxes,
-                               ha='center', va='center', fontsize=16, color='red')
-                axes[1, 1].axis('off')
-                
-                failed_detections += 1
+                for ax in [axes[1, 0], axes[0, 2], axes[1, 1], axes[1, 2]]:
+                    ax.text(0.5, 0.5, 'No Detection', transform=ax.transAxes,
+                            ha='center', va='center', fontsize=14, color='red')
+                    ax.axis('off')
+                failed += 1
                 results_summary.append({
-                    'filename': filename,
-                    'status': 'FAILED',
+                    'filename': filename, 'status': 'FAILED',
                     'image_type': detector.image_type
                 })
-                
-                print(f"✗ NO DETECTION ({detector.image_type})")
-            
+                print(f"  NO DETECTION ({detector.image_type})")
+
             plt.tight_layout()
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             cv2.imwrite(save_path.replace('.png', '_result.png'), result)
             plt.close()
-            
-        except Exception as e:
-            print(f"✗ ERROR: {str(e)}")
-            failed_detections += 1
-            results_summary.append({
-                'filename': filename,
-                'status': 'ERROR',
-                'error': str(e)
-            })
-    
-    print("\n" + "="*60)
-    print("PROCESSING COMPLETE - SUMMARY")
-    print("="*60)
-    print(f"Total images processed: {len(image_files)}")
-    print(f"Fundus images: {fundus_count}")
-    print(f"B-scan images: {bscan_count}")
-    print(f"Successful detections: {successful_detections}")
-    print(f"Failed detections: {failed_detections}")
-    print(f"Success rate: {(successful_detections/len(image_files)*100):.1f}%")
-    
 
-    output_dir = "/Users/williambaranano/Desktop/python/optic_disc_results"
-    csv_path = os.path.join(output_dir, "detection_results_with_bscans.csv")
-    
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            failed += 1
+            results_summary.append({'filename': filename, 'status': 'ERROR', 'error': str(e)})
+
+    print("\n" + "=" * 60)
+    print("PROCESSING COMPLETE")
+    print("=" * 60)
+    print(f"Total: {len(image_files)}  |  Fundus: {fundus_count}  |  B-scan: {bscan_count}")
+    print(f"Success: {successful}  |  Failed: {failed}  |  "
+          f"Rate: {successful / max(len(image_files), 1) * 100:.1f}%")
+
+    csv_path = os.path.join(output_dir, "detection_results.csv")
+    N_COLS = 13  # number of data columns after the first three
     with open(csv_path, 'w') as f:
-        f.write("Filename,Status,Image_Type,Center_X,Center_Y,Intensity,Area,Height,Width,Measurement_Value\n")
-        for result in results_summary:
-            if result['status'] == 'SUCCESS':
-                measurement = result.get('nerve_head_height', result.get('optic_disc_radius', 'N/A'))
-                f.write(f"{result['filename']},SUCCESS,{result['image_type']},"
-                       f"{result['center'][0]},{result['center'][1]},"
-                       f"{result['intensity']:.1f},{result['area']:.0f},"
-                       f"{result['height']},{result['width']},{measurement}\n")
+        f.write(
+            "Filename,Status,Image_Type,Pixels_Per_MM,"
+            "ONSD_mm,"
+            "Posterior_Globe_Area_mm2,"
+            "Radius_of_Curvature_mm,"
+            "CRAE_mm,"
+            "CRVE_mm,"
+            "AVR,"
+            "Optic_Disc_Radius_mm,"
+            "Nerve_Head_Height_mm,"
+            "Nerve_Head_Width_mm\n"
+        )
+        for r in results_summary:
+            def f2(v, dp=3):
+                if v == '' or v is None:
+                    return ''
+                if isinstance(v, float):
+                    return f"{v:.{dp}f}"
+                return str(v)
+
+            if r['status'] == 'SUCCESS':
+                f.write(
+                    f"{r['filename']},SUCCESS,{r['image_type']},{r['pixels_per_mm']:.1f},"
+                    f"{f2(r['onsd_mm'])},"
+                    f"{f2(r['posterior_globe_area_mm2'], 2)},"
+                    f"{f2(r['radius_of_curvature_mm'])},"
+                    f"{f2(r['crae_mm'])},"
+                    f"{f2(r['crve_mm'])},"
+                    f"{f2(r['avr'])},"
+                    f"{f2(r['optic_disc_radius_mm'])},"
+                    f"{f2(r['nerve_head_height_mm'])},"
+                    f"{f2(r['nerve_head_width_mm'])}\n"
+                )
             else:
-                f.write(f"{result['filename']},{result['status']},{result.get('image_type', 'unknown')},,,,,,\n")
-    
+                f.write(f"{r['filename']},{r['status']},{r.get('image_type','unknown')}"
+                        + "," * N_COLS + "\n")
+
     print(f"\nResults saved to: {csv_path}")
-    
     return results_summary
 
-def test_detection():
-    """Test with a single image (supports both fundus and B-scans)"""
+
+# ================================================================
+# SINGLE-IMAGE TEST
+# ================================================================
+
+def test_detection(input_dir=None):
+    """Test with the first image found in input_dir"""
     detector = OpticDiscDetector()
 
-    input_dir = "/Users/williambaranano/Downloads/osv images/DR1-additional-marked-images"
-    
+    if input_dir is None:
+        input_dir = os.environ.get(
+            'OPTIC_INPUT_DIR',
+            os.path.join(os.path.dirname(__file__), 'images')
+        )
+
     if not os.path.exists(input_dir):
         print(f"Input directory not found: {input_dir}")
         return
-    
 
     image_files = []
     for ext in ['.pgm', '.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp']:
-        image_files.extend([f for f in os.listdir(input_dir) if f.lower().endswith(ext)])
-    
+        image_files.extend(
+            [f for f in os.listdir(input_dir) if f.lower().endswith(ext)]
+        )
+
     if not image_files:
         print("No image files found in the directory")
         return
-    
-  
+
     test_image = os.path.join(input_dir, image_files[0])
     print(f"Testing with: {image_files[0]}")
-    
+
     try:
-        candidates, original, processed = detector.detect_optic_disc(test_image)
-        
+        candidates, original, processed, measurements = detector.detect_optic_disc(test_image)
+
         if candidates:
             best = candidates[0]
-            print(f"✓ Detection successful!")
-            print(f"Image type: {detector.image_type}")
-            print(f"Center: {best['center']}")
-            print(f"Intensity: {best['intensity']:.1f}")
-            
+            print(f"\nDetection successful!")
+            print(f"Image type       : {detector.image_type}")
+            print(f"Center           : {best['center']}")
+            print(f"Intensity        : {best['intensity']:.1f}")
+
             if detector.image_type == 'bscan':
-                print(f"Nerve head height: {best['height']} pixels")
+                print(f"Nerve head height: {measurements.get('nerve_head_height', 'N/A')} px")
+                print(f"Nerve head width : {measurements.get('nerve_head_width', 'N/A')} px")
             else:
-                print(f"Optic disc radius: {best.get('radius', 'N/A')} pixels")
-            
-           
-            detector.visualize_results(candidates, original, processed)
-            return best
+                print(f"Optic disc radius: {measurements.get('optic_disc_radius', 'N/A'):.1f} px")
+
+            onsd = measurements.get('onsd')
+            area = measurements.get('posterior_globe_area')
+            roc  = measurements.get('radius_of_curvature')
+            print(f"ONSD             : {onsd:.1f} px" if onsd else "ONSD             : N/A")
+            print(f"Post. globe area : {area:.0f} px²" if area else "Post. globe area : N/A")
+            print(f"Radius of curv.  : {roc:.1f} px" if roc else "Radius of curv.  : N/A")
+
+            if detector.image_type == 'fundus':
+                crae = measurements.get('crae')
+                crve = measurements.get('crve')
+                avr  = measurements.get('avr')
+                print(f"CRAE             : {crae:.2f} px" if crae else "CRAE             : N/A")
+                print(f"CRVE             : {crve:.2f} px" if crve else "CRVE             : N/A")
+                if avr:
+                    norm = " (normal)" if 0.67 <= avr <= 0.75 else " (arteriolar narrowing)" if avr < 0.67 else " (wide veins)"
+                    print(f"AVR              : {avr:.3f}{norm}")
+                else:
+                    print("AVR              : N/A")
+
+            detector.visualize_results(candidates, original, processed, measurements)
+            return best, measurements
         else:
-            print("✗ No detection found")
-            return None
+            print("No detection found")
+            return None, {}
     except Exception as e:
-        print(f"✗ Error: {e}")
-        return None
+        print(f"Error: {e}")
+        return None, {}
+
+
+# ================================================================
+# GUI FOLDER PICKER — open a folder and process every image in it
+# ================================================================
+
+def select_folder_and_run(pixels_per_mm=None):
+    """
+    Open a GUI folder-picker dialog, then run the full detection pipeline
+    on every image found in the chosen folder.
+
+    Parameters
+    ----------
+    pixels_per_mm : float or None
+        Override the automatic scale factor (px/mm).  Pass None to use the
+        built-in defaults (54 px/mm for fundus, 13 px/mm for B-scan).
+
+    Returns
+    -------
+    results : list of dicts  (same format as process_all_images)
+    """
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+
+    # Build a hidden root window so the dialog has a parent
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)   # bring dialog to front
+
+    # ---- Ask for input folder ----------------------------------------
+    input_dir = filedialog.askdirectory(
+        title="Select folder containing fundus / B-scan images",
+        mustexist=True,
+    )
+
+    if not input_dir:
+        print("No folder selected — cancelled.")
+        root.destroy()
+        return []
+
+    # Count images first so the user knows what they picked
+    EXTS = {'.pgm', '.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp'}
+    image_files = [
+        f for f in os.listdir(input_dir)
+        if os.path.splitext(f.lower())[1] in EXTS
+    ]
+
+    if not image_files:
+        messagebox.showerror(
+            "No images found",
+            f"No supported image files found in:\n{input_dir}\n\n"
+            "Supported formats: PGM, TIF, TIFF, JPG, JPEG, PNG, BMP"
+        )
+        root.destroy()
+        return []
+
+    # ---- Ask for output folder (default: subfolder next to input) ----
+    default_out = os.path.join(input_dir, "ocular_detection_results")
+    output_dir = filedialog.askdirectory(
+        title=f"Select output folder  ({len(image_files)} images found — press Cancel to use default)",
+        initialdir=os.path.dirname(input_dir),
+    )
+
+    if not output_dir:
+        output_dir = default_out
+        print(f"Using default output folder: {output_dir}")
+
+    root.destroy()
+
+    print(f"\nInput  folder : {input_dir}")
+    print(f"Output folder : {output_dir}")
+    print(f"Images found  : {len(image_files)}")
+    if pixels_per_mm:
+        print(f"Scale override: {pixels_per_mm} px/mm")
+    else:
+        print("Scale         : auto (54 px/mm fundus / 13 px/mm B-scan)")
+
+    results = process_all_images(
+        input_dir=input_dir,
+        output_dir=output_dir,
+        pixels_per_mm=pixels_per_mm,
+    )
+
+    # Show a short completion summary in a message box
+    try:
+        root2 = tk.Tk()
+        root2.withdraw()
+        root2.attributes('-topmost', True)
+        ok   = sum(1 for r in results if r.get('status') == 'SUCCESS')
+        fail = len(results) - ok
+        csv_path = os.path.join(output_dir, "detection_results.csv")
+        messagebox.showinfo(
+            "Detection complete",
+            f"Processed : {len(results)} images\n"
+            f"Detected  : {ok}\n"
+            f"Failed    : {fail}\n\n"
+            f"CSV saved to:\n{csv_path}"
+        )
+        root2.destroy()
+    except Exception:
+        pass   # GUI summary is optional
+
+    return results
+
 
 if __name__ == "__main__":
     import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--all":
-        print("Processing ALL images (fundus and B-scans)...")
-        process_all_images()
-    else:
-        print("Processing SINGLE image (use '--all' flag to process all images)")
-        test_detection()
 
-#python3 improved_optic_disc_detector.py --all
+    # Usage:
+    #   python3 improved_optic_disc_detector.py            → GUI folder picker
+    #   python3 improved_optic_disc_detector.py --all <in> [<out>]
+    #   python3 improved_optic_disc_detector.py <input_dir>
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--all":
+        idir = sys.argv[2] if len(sys.argv) > 2 else None
+        odir = sys.argv[3] if len(sys.argv) > 3 else None
+        print("Processing ALL images...")
+        process_all_images(input_dir=idir, output_dir=odir)
+    elif len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
+        print("Processing SINGLE image...")
+        test_detection(input_dir=sys.argv[1])
+    else:
+        # Default: open GUI folder picker and process everything
+        select_folder_and_run()
