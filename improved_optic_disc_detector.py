@@ -429,23 +429,36 @@ class OpticDiscDetector:
             # Must have some vertical extent
             if h_cand < 15:
                 continue
+            # Nerve head should not span more than 40 % of image height.
+            # Anything taller is a large tissue mass or artifact, not the nerve.
+            if h_cand > img_h * 0.40:
+                continue
             # Must not be a horizontal sliver (e.g. the globe wall itself)
             if candidate['aspect_ratio'] < 0.4:
                 continue
-            # Must not hug the very edge
-            margin = 20
-            if not (margin < cx < img_w - margin and margin < cy < img_h - margin):
+            # Must not hug the very edge — use proportional margins so the
+            # filter scales with image size rather than a fixed 20 px.
+            h_margin = max(20, int(img_h * 0.05))
+            w_margin = max(20, int(img_w * 0.08))
+            if not (w_margin < cx < img_w - w_margin and h_margin < cy < img_h - h_margin):
                 continue
-            # Exclude structures that span > 60 % of image width (globe wall artefacts)
-            if w_cand > img_w * 0.60:
+            # Nerve head center should not be in the top vitreous region (top 15 % of image)
+            if cy < img_h * 0.15:
+                continue
+            # Exclude structures wider than 20 % of image width.
+            # The previous 60 % limit allowed large tissue blobs to pass.
+            if w_cand > img_w * 0.20:
                 continue
 
             filtered.append(candidate)
 
         def score_bscan_candidate(cand):
             brightness_score = cand['intensity'] / 255.0
-            # Reward tall, compact structures — favour height over raw area
-            height_score  = min(cand['height'] / (img_h * 0.5), 1.0)
+            # Reward structures sized like a real nerve head (5–20 % of image height).
+            # Score peaks at 12 % of image height and falls off on both sides so that
+            # oversized blobs no longer outscore compact, correctly-sized candidates.
+            ideal_h = img_h * 0.12
+            height_score = max(0.0, 1.0 - abs(cand['height'] - ideal_h) / ideal_h)
             vertical_score = min(cand['aspect_ratio'] / 2.0, 1.0)
             solidity_score = cand['solidity']
             return (0.40 * brightness_score
