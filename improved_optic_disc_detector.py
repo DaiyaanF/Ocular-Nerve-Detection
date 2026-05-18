@@ -15,12 +15,16 @@ class OpticDiscDetector:
         self.image_type = None  # 'fundus' or 'bscan'
         # If supplied, overrides the per-type defaults for both image types.
         self.pixels_per_mm = pixels_per_mm
+        # Set by _load_dicom() when DICOM spatial calibration tags are present.
+        self._dicom_ppm = None
 
     @property
     def _ppm(self):
         """Return the effective pixels-per-mm for the current image type."""
         if self.pixels_per_mm is not None:
             return float(self.pixels_per_mm)
+        if self._dicom_ppm is not None:
+            return float(self._dicom_ppm)
         if self.image_type == 'bscan':
             return self.DEFAULT_PPM_BSCAN
         return self.DEFAULT_PPM_FUNDUS
@@ -41,8 +45,94 @@ class OpticDiscDetector:
     # IMAGE LOADING & TYPE DETECTION
     # ============================================================
 
+    def _load_dicom(self, image_path):
+        """
+        Load a DICOM file and return a single grayscale frame.
+
+        Handles:
+          - Single-frame DICOM (shape H×W or H×W×3)
+          - Multi-frame DICOM (shape N×H×W or N×H×W×3) — picks the frame
+            whose mean brightness is closest to the overall median, which
+            reliably avoids blank/artifact frames.
+        """
+        try:
+            import pydicom
+        except ImportError:
+            raise ImportError(
+                "pydicom is required to read DICOM files.\n"
+                "Install with:  pip install pydicom pylibjpeg pylibjpeg-libjpeg"
+            )
+
+        ds  = pydicom.dcmread(image_path)
+        arr = ds.pixel_array          # shape varies
+
+        # Normalise to uint8
+        if arr.dtype != np.uint8:
+            arr = cv2.normalize(arr.astype(np.float32), None, 0, 255,
+                                cv2.NORM_MINMAX).astype(np.uint8)
+
+        # Multi-frame (N, H, W) or (N, H, W, C)
+        if arr.ndim == 4:
+            # colour multi-frame — pick best frame, then convert to grey
+            frame_means = [arr[i].mean() for i in range(arr.shape[0])]
+            med = float(np.median(frame_means))
+            best = int(np.argmin([abs(m - med) for m in frame_means]))
+            frame = arr[best]
+        elif arr.ndim == 3:
+            if arr.shape[2] in (3, 4):
+                # Single colour frame
+                frame = arr
+            else:
+                # (N, H, W) greyscale multi-frame
+                frame_means = arr.mean(axis=(1, 2))
+                med = float(np.median(frame_means))
+                best = int(np.argmin(np.abs(frame_means - med)))
+                frame = arr[best]
+        else:
+            frame = arr   # already 2D
+
+        # Convert colour to greyscale
+        if frame.ndim == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+        # Extract physical pixel spacing (px/mm).
+        # Priority 1: SequenceOfUltrasoundRegions — standard for US DICOM
+        ppm = None
+        us_regions = getattr(ds, 'SequenceOfUltrasoundRegions', None)
+        if us_regions:
+            region = us_regions[0]
+            dx = getattr(region, 'PhysicalDeltaX', None)
+            units = getattr(region, 'PhysicalUnitsXDirection', 0)
+            if dx is not None:
+                dx_mm = float(dx)
+                # units: 3 = cm → convert to mm
+                if units == 3:
+                    dx_mm *= 10.0
+                # dx_mm is now mm/px → invert to px/mm
+                if dx_mm > 0:
+                    ppm = 1.0 / dx_mm
+        # Priority 2: PixelSpacing tag (mm/px)
+        if ppm is None:
+            ps = getattr(ds, 'PixelSpacing', None)
+            if ps is not None and len(ps) >= 2 and float(ps[0]) > 0:
+                ppm = 1.0 / float(ps[0])
+        self._dicom_ppm = ppm
+
+        # Force image_type based on DICOM modality so auto-detection is not needed.
+        # US = Ultrasound B-scan, OPT = OCT — both are B-scans for our pipeline.
+        modality = getattr(ds, 'Modality', '').upper()
+        if modality in ('US', 'OPT', 'OCT'):
+            self.image_type = 'bscan'
+        elif modality in ('CF', 'OP'):  # colour fundus / ophthalmic photography
+            self.image_type = 'fundus'
+        # else: leave None so detect_image_type() decides normally
+
+        return frame
+
     def load_image(self, image_path):
-        """Load and return grayscale image"""
+        """Load and return a grayscale image (supports DICOM and standard formats)."""
+        if image_path.lower().endswith('.dcm'):
+            return self._load_dicom(image_path)
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise ValueError(f"Cannot load image: {image_path}")
@@ -127,8 +217,14 @@ class OpticDiscDetector:
 
     def preprocess_image(self, image):
         """Adaptive preprocessing based on image type"""
-        image_type = self.detect_image_type(image)
-        if image_type == 'bscan':
+        # If type was already set by DICOM modality, keep it; otherwise auto-detect.
+        if self.image_type is None:
+            self.detect_image_type(image)
+        elif self.debug:
+            h, w = image.shape
+            print(f"Image type forced by DICOM modality: {self.image_type} "
+                  f"(AR={w/h:.2f})")
+        if self.image_type == 'bscan':
             return self.preprocess_bscan_image(image)
         else:
             return self.preprocess_fundus_image(image)
@@ -996,18 +1092,22 @@ class OpticDiscDetector:
 # BATCH PROCESSING
 # ================================================================
 
-def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
+def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None, recursive=True):
     """
-    Process all images in input_dir and save per-image PNG results + a CSV
+    Process all images under input_dir and save per-image PNG results + a CSV
     summary to output_dir.
 
     Parameters
     ----------
-    input_dir     : path to folder containing images (prompted if None)
-    output_dir    : path to write results (auto-created if needed; defaults to
-                    a subfolder inside input_dir)
+    input_dir     : root folder to search (prompted if None)
+    output_dir    : where to write results (auto-created; defaults to a
+                    subfolder next to input_dir)
     pixels_per_mm : override scale factor; None = use per-type defaults
+    recursive     : if True (default) walk all subdirectories; if False only
+                    look in the immediate input_dir
     """
+    EXTS = {'.pgm', '.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp', '.dcm'}
+
     detector = OpticDiscDetector(pixels_per_mm=pixels_per_mm)
 
     if input_dir is None:
@@ -1020,11 +1120,20 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
         print(f"Input directory not found: {input_dir}")
         return
 
+    # Collect (absolute_path, relative_path) pairs
     image_files = []
-    for ext in ['.pgm', '.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp']:
-        image_files.extend(
-            [f for f in os.listdir(input_dir) if f.lower().endswith(ext)]
-        )
+    if recursive:
+        for root, _dirs, files in os.walk(input_dir):
+            for fname in sorted(files):
+                if os.path.splitext(fname.lower())[1] in EXTS:
+                    abs_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(abs_path, input_dir)
+                    image_files.append((abs_path, rel_path))
+    else:
+        for fname in sorted(os.listdir(input_dir)):
+            if os.path.splitext(fname.lower())[1] in EXTS:
+                abs_path = os.path.join(input_dir, fname)
+                image_files.append((abs_path, fname))
 
     if not image_files:
         print("No image files found in the directory")
@@ -1046,9 +1155,14 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
     fundus_count = 0
     bscan_count = 0
 
-    for i, filename in enumerate(image_files, 1):
-        image_path = os.path.join(input_dir, filename)
-        print(f"\n[{i}/{len(image_files)}] {filename}")
+    for i, (image_path, rel_path) in enumerate(image_files, 1):
+        filename = os.path.basename(image_path)
+        # Extract subject and condition from path components, e.g.
+        # Flight/TRISH-4449/scan.dcm  → condition=Flight, subject=TRISH-4449
+        parts = rel_path.replace('\\', '/').split('/')
+        condition = parts[0] if len(parts) >= 3 else ''
+        subject   = parts[1] if len(parts) >= 3 else (parts[0] if len(parts) == 2 else '')
+        print(f"\n[{i}/{len(image_files)}] {rel_path}")
 
         try:
             candidates, original, processed, measurements = detector.detect_optic_disc(image_path)
@@ -1166,7 +1280,9 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
                 successful += 1
                 ppm = detector._ppm
                 results_summary.append({
-                    'filename': filename,
+                    'filename': rel_path,
+                    'condition': condition,
+                    'subject': subject,
                     'status': 'SUCCESS',
                     'image_type': detector.image_type,
                     'pixels_per_mm': ppm,
@@ -1203,8 +1319,8 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
                     ax.axis('off')
                 failed += 1
                 results_summary.append({
-                    'filename': filename, 'status': 'FAILED',
-                    'image_type': detector.image_type
+                    'filename': rel_path, 'condition': condition, 'subject': subject,
+                    'status': 'FAILED', 'image_type': detector.image_type
                 })
                 print(f"  NO DETECTION ({detector.image_type})")
 
@@ -1216,7 +1332,10 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
         except Exception as e:
             print(f"  ERROR: {e}")
             failed += 1
-            results_summary.append({'filename': filename, 'status': 'ERROR', 'error': str(e)})
+            results_summary.append({
+                'filename': rel_path, 'condition': condition, 'subject': subject,
+                'status': 'ERROR', 'error': str(e)
+            })
 
     print("\n" + "=" * 60)
     print("PROCESSING COMPLETE")
@@ -1226,10 +1345,10 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
           f"Rate: {successful / max(len(image_files), 1) * 100:.1f}%")
 
     csv_path = os.path.join(output_dir, "detection_results.csv")
-    N_COLS = 13  # number of data columns after the first three
+    N_COLS = 13  # data columns after Condition,Subject,Filename,Status,Image_Type,Pixels_Per_MM
     with open(csv_path, 'w') as f:
         f.write(
-            "Filename,Status,Image_Type,Pixels_Per_MM,"
+            "Condition,Subject,Filename,Status,Image_Type,Pixels_Per_MM,"
             "ONSD_mm,"
             "Posterior_Globe_Area_mm2,"
             "Radius_of_Curvature_mm,"
@@ -1248,9 +1367,11 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
                     return f"{v:.{dp}f}"
                 return str(v)
 
+            cond = r.get('condition', '')
+            subj = r.get('subject', '')
             if r['status'] == 'SUCCESS':
                 f.write(
-                    f"{r['filename']},SUCCESS,{r['image_type']},{r['pixels_per_mm']:.1f},"
+                    f"{cond},{subj},{r['filename']},SUCCESS,{r['image_type']},{r['pixels_per_mm']:.1f},"
                     f"{f2(r['onsd_mm'])},"
                     f"{f2(r['posterior_globe_area_mm2'], 2)},"
                     f"{f2(r['radius_of_curvature_mm'])},"
@@ -1262,7 +1383,7 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None):
                     f"{f2(r['nerve_head_width_mm'])}\n"
                 )
             else:
-                f.write(f"{r['filename']},{r['status']},{r.get('image_type','unknown')}"
+                f.write(f"{cond},{subj},{r['filename']},{r['status']},{r.get('image_type','unknown')}"
                         + "," * N_COLS + "\n")
 
     print(f"\nResults saved to: {csv_path}")
@@ -1288,7 +1409,7 @@ def test_detection(input_dir=None):
         return
 
     image_files = []
-    for ext in ['.pgm', '.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp']:
+    for ext in ['.pgm', '.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp', '.dcm']:
         image_files.extend(
             [f for f in os.listdir(input_dir) if f.lower().endswith(ext)]
         )
@@ -1383,18 +1504,19 @@ def select_folder_and_run(pixels_per_mm=None):
         root.destroy()
         return []
 
-    # Count images first so the user knows what they picked
-    EXTS = {'.pgm', '.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp'}
-    image_files = [
-        f for f in os.listdir(input_dir)
-        if os.path.splitext(f.lower())[1] in EXTS
-    ]
+    # Count images first (recursive) so the user knows what they picked
+    EXTS = {'.pgm', '.tif', '.tiff', '.jpg', '.jpeg', '.png', '.bmp', '.dcm'}
+    image_files = []
+    for _, _, files in os.walk(input_dir):
+        for fname in files:
+            if os.path.splitext(fname.lower())[1] in EXTS:
+                image_files.append(fname)
 
     if not image_files:
         messagebox.showerror(
             "No images found",
             f"No supported image files found in:\n{input_dir}\n\n"
-            "Supported formats: PGM, TIF, TIFF, JPG, JPEG, PNG, BMP"
+            "Supported formats: PGM, TIF, TIFF, JPG, JPEG, PNG, BMP, DCM"
         )
         root.destroy()
         return []
