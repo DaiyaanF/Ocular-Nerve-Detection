@@ -1133,18 +1133,26 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None, recu
         print(f"Input directory not found: {input_dir}")
         return
 
+    # Suffixes added by this tool's own visualise_results / process_all_images.
+    # Skipping them prevents the detector from re-processing its own output images.
+    OUTPUT_SUFFIXES = ('_detection', '_detection_result')
+
+    def _is_own_output(fname):
+        stem = os.path.splitext(fname)[0]
+        return any(stem.endswith(s) for s in OUTPUT_SUFFIXES)
+
     # Collect (absolute_path, relative_path) pairs
     image_files = []
     if recursive:
         for root, _dirs, files in os.walk(input_dir):
             for fname in sorted(files):
-                if os.path.splitext(fname.lower())[1] in EXTS:
+                if os.path.splitext(fname.lower())[1] in EXTS and not _is_own_output(fname):
                     abs_path = os.path.join(root, fname)
                     rel_path = os.path.relpath(abs_path, input_dir)
                     image_files.append((abs_path, rel_path))
     else:
         for fname in sorted(os.listdir(input_dir)):
-            if os.path.splitext(fname.lower())[1] in EXTS:
+            if os.path.splitext(fname.lower())[1] in EXTS and not _is_own_output(fname):
                 abs_path = os.path.join(input_dir, fname)
                 image_files.append((abs_path, fname))
 
