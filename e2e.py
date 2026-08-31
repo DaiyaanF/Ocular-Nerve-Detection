@@ -476,7 +476,15 @@ def compute_vascular_metrics(img, sx):
 
     crae = _knudtson(arteries, 0.88) if len(arteries) >= 2 else (arteries[0] if arteries else None)
     crve = _knudtson(veins,    0.95) if len(veins)    >= 2 else (veins[0]    if veins    else None)
-    avr  = (crae / crve) if (crae and crve and crve > 0) else None
+
+    # Physiological constraint: arteries must be narrower than veins (CRAE < CRVE).
+    # If the shadow classifier flipped them, swap and recompute.
+    if crae is not None and crve is not None and crae > crve:
+        arteries, veins = veins, arteries
+        crae = _knudtson(arteries, 0.88) if len(arteries) >= 2 else (arteries[0] if arteries else None)
+        crve = _knudtson(veins,    0.95) if len(veins)    >= 2 else (veins[0]    if veins    else None)
+
+    avr = (crae / crve) if (crae and crve and crve > 0 and crae < crve) else None
 
     return crae, crve, avr
 

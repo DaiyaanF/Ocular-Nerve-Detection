@@ -633,37 +633,20 @@ class OpticDiscDetector:
         }
 
     def _measure_globe_fundus(self, image):
+        # The posterior globe wall is NOT visible in a fundus photograph —
+        # only the inner retinal surface is imaged.  Measuring the camera
+        # FOV boundary produces numbers that change with zoom/camera model,
+        # creating spurious pre/post deltas.  Return None for both metrics
+        # so they are excluded from the CSV rather than silently wrong.
         img_h, img_w = image.shape
-        # Fundus images have a circular bright field on a dark background
-        _, thresh = cv2.threshold(image, 10, 255, cv2.THRESH_BINARY)
-
-        circles = cv2.HoughCircles(
-            thresh,
-            cv2.HOUGH_GRADIENT,
-            dp=2,
-            minDist=min(img_h, img_w) // 2,
-            param1=50,
-            param2=30,
-            minRadius=min(img_h, img_w) // 4,
-            maxRadius=min(img_h, img_w) // 2
-        )
-
-        if circles is not None:
-            circles = np.round(circles[0]).astype(int)
-            cx, cy, r = sorted(circles, key=lambda c: c[2], reverse=True)[0]
-        else:
-            r = min(img_h, img_w) // 2
-            cx, cy = img_w // 2, img_h // 2
-
-        area = np.pi * r ** 2
         if self.debug:
-            print(f"Posterior globe (fundus FOV): r={r}px, area={area:.0f}px²")
+            print("Posterior globe (fundus): not measurable from fundus image — skipped")
         return {
-            'globe_center': (int(cx), int(cy)),
-            'globe_radius': float(r),
-            'cross_sectional_area': float(area),
-            'radius_of_curvature': float(r),
-            'method': 'fundus_fov'
+            'globe_center': (img_w // 2, img_h // 2),
+            'globe_radius': None,
+            'cross_sectional_area': None,
+            'radius_of_curvature': None,
+            'method': 'not_applicable'
         }
 
     # ============================================================
@@ -792,7 +775,17 @@ class OpticDiscDetector:
 
         crae = self._knudtson_combine(arteries, 0.88) if len(arteries) >= 2 else (arteries[0] if arteries else None)
         crve = self._knudtson_combine(veins,    0.95) if len(veins)    >= 2 else (veins[0]    if veins    else None)
-        avr  = (crae / crve) if (crae and crve and crve > 0) else None
+
+        # Physiological constraint: arteries are always narrower than veins (AVR < 1).
+        # If the classifier flipped them, swap and recompute.
+        if crae is not None and crve is not None and crae > crve:
+            arteries, veins = veins, arteries
+            crae = self._knudtson_combine(arteries, 0.88) if len(arteries) >= 2 else (arteries[0] if arteries else None)
+            crve = self._knudtson_combine(veins,    0.95) if len(veins)    >= 2 else (veins[0]    if veins    else None)
+            if self.debug:
+                print("  Artery/vein labels swapped to enforce CRAE < CRVE")
+
+        avr = (crae / crve) if (crae and crve and crve > 0 and crae < crve) else None
 
         if self.debug:
             print(f"Artery calibers ({len(arteries)}): {[f'{c:.1f}' for c in arteries]}")
@@ -836,6 +829,11 @@ class OpticDiscDetector:
             avr                    (dimensionless, fundus only)
             vessel_mask            (ndarray, fundus only)
         """
+        # Reset per-image state so a previous file's DICOM modality / scale
+        # never bleeds into the next file.
+        self.image_type  = None
+        self._dicom_ppm  = None
+
         image = self.load_image(image_path)
         processed = self.preprocess_image(image)
 
@@ -977,9 +975,10 @@ class OpticDiscDetector:
                 # Posterior globe circle
                 if measurements and measurements.get('posterior_globe'):
                     globe = measurements['posterior_globe']
-                    gc = globe['globe_center']
-                    gr = int(globe['globe_radius'])
-                    cv2.circle(result, gc, gr, (255, 165, 0), 2)
+                    if globe.get('globe_radius') is not None:
+                        gc = globe['globe_center']
+                        gr = int(globe['globe_radius'])
+                        cv2.circle(result, gc, gr, (255, 165, 0), 2)
 
             else:
                 radius = best.get('radius', 20)
@@ -1004,9 +1003,10 @@ class OpticDiscDetector:
                 # Posterior globe boundary
                 if measurements and measurements.get('posterior_globe'):
                     globe = measurements['posterior_globe']
-                    gc = globe['globe_center']
-                    gr = int(globe['globe_radius'])
-                    cv2.circle(result, gc, gr, (255, 165, 0), 2)
+                    if globe.get('globe_radius') is not None:
+                        gc = globe['globe_center']
+                        gr = int(globe['globe_radius'])
+                        cv2.circle(result, gc, gr, (255, 165, 0), 2)
 
         axes[1, 0].imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
         axes[1, 0].set_title(f'Detection ({self.image_type.upper()})')
@@ -1220,9 +1220,10 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None, recu
                                  (center[0] + half, center[1]),
                                  (0, 255, 255), 2)
                     if measurements.get('posterior_globe'):
-                        gc = measurements['posterior_globe']['globe_center']
-                        gr = int(measurements['posterior_globe']['globe_radius'])
-                        cv2.circle(result, gc, gr, (255, 165, 0), 2)
+                        if measurements['posterior_globe'].get('globe_radius') is not None:
+                            gc = measurements['posterior_globe']['globe_center']
+                            gr = int(measurements['posterior_globe']['globe_radius'])
+                            cv2.circle(result, gc, gr, (255, 165, 0), 2)
                 else:
                     fundus_count += 1
                     radius = best.get('radius', 20)
@@ -1232,9 +1233,10 @@ def process_all_images(input_dir=None, output_dir=None, pixels_per_mm=None, recu
                     if measurements.get('vessel_mask') is not None:
                         result[measurements['vessel_mask'] > 0] = [200, 0, 180]
                     if measurements.get('posterior_globe'):
-                        gc = measurements['posterior_globe']['globe_center']
-                        gr = int(measurements['posterior_globe']['globe_radius'])
-                        cv2.circle(result, gc, gr, (255, 165, 0), 2)
+                        if measurements['posterior_globe'].get('globe_radius') is not None:
+                            gc = measurements['posterior_globe']['globe_center']
+                            gr = int(measurements['posterior_globe']['globe_radius'])
+                            cv2.circle(result, gc, gr, (255, 165, 0), 2)
 
                 axes[1, 0].imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
                 axes[1, 0].set_title(f'Detection ({detector.image_type.upper()})')
