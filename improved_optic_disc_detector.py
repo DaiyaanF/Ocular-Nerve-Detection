@@ -410,12 +410,35 @@ class OpticDiscDetector:
         filtered.sort(key=score_candidate, reverse=True)
         return filtered
 
-    def filter_candidates_bscan(self, candidates, image_shape):
+    def filter_candidates_bscan(self, candidates, image_shape, globe=None):
         if not candidates:
             return []
 
         img_h, img_w = image_shape
         filtered = []
+
+        # Anatomical ROI: the optic nerve exits the globe posteriorly, along
+        # the central visual axis, immediately behind the globe wall — it is
+        # NEVER inside or beside the globe. If we already know where the
+        # globe is, restrict the search to a band directly below it,
+        # centered on the globe's x position. This is what actually fixes
+        # brightness scoring from locking onto stray bright artifacts
+        # (probe icon, globe-wall rim, orbital fat) instead of the nerve.
+        # Only gate against a *real* Hough-detected globe. The crude fallback
+        # (image-center estimate used when Hough finds nothing) isn't
+        # trustworthy enough to anchor a search region — gating against it
+        # could push detection toward the wrong spot instead of just leaving
+        # the ungated brightness/shape scoring to do its best.
+        roi = None
+        if globe and globe.get('globe_radius') and globe.get('method') == 'hough_circle':
+            gx, gy = globe['globe_center']
+            gr = globe['globe_radius']
+            roi = {
+                'y_min': gy + gr * 0.45,   # just past the bottom of the globe wall
+                'y_max': gy + gr * 1.9,    # nerve complex sits within ~1x radius behind it
+                'x_min': gx - gr * 0.65,   # narrow band around the visual axis
+                'x_max': gx + gr * 0.65,
+            }
 
         for candidate in candidates:
             area = candidate['area']
@@ -449,8 +472,18 @@ class OpticDiscDetector:
             # The previous 60 % limit allowed large tissue blobs to pass.
             if w_cand > img_w * 0.20:
                 continue
+            # Must sit in the posterior-globe ROI when the globe is known.
+            if roi and not (roi['y_min'] <= cy <= roi['y_max']
+                             and roi['x_min'] <= cx <= roi['x_max']):
+                continue
 
             filtered.append(candidate)
+
+        # If gating against the globe ROI wiped out every candidate (e.g. the
+        # globe itself was mis-detected), fall back to the ungated pass rather
+        # than returning nothing.
+        if roi and not filtered:
+            return self.filter_candidates_bscan(candidates, image_shape, globe=None)
 
         def score_bscan_candidate(cand):
             brightness_score = cand['intensity'] / 255.0
@@ -461,6 +494,17 @@ class OpticDiscDetector:
             height_score = max(0.0, 1.0 - abs(cand['height'] - ideal_h) / ideal_h)
             vertical_score = min(cand['aspect_ratio'] / 2.0, 1.0)
             solidity_score = cand['solidity']
+            if roi:
+                # Reward candidates closer to the globe's central axis —
+                # the nerve sits on it, artifacts off to the side don't.
+                gx = globe['globe_center'][0]
+                gr = globe['globe_radius']
+                axis_score = max(0.0, 1.0 - abs(cand['center'][0] - gx) / gr)
+                return (0.30 * brightness_score
+                        + 0.20 * height_score
+                        + 0.15 * vertical_score
+                        + 0.10 * solidity_score
+                        + 0.25 * axis_score)
             return (0.40 * brightness_score
                     + 0.25 * height_score
                     + 0.20 * vertical_score
@@ -469,9 +513,9 @@ class OpticDiscDetector:
         filtered.sort(key=score_bscan_candidate, reverse=True)
         return filtered
 
-    def filter_candidates(self, candidates, image_shape):
+    def filter_candidates(self, candidates, image_shape, globe=None):
         if self.image_type == 'bscan':
-            return self.filter_candidates_bscan(candidates, image_shape)
+            return self.filter_candidates_bscan(candidates, image_shape, globe=globe)
         else:
             return self.filter_candidates_fundus(candidates, image_shape)
 
@@ -593,16 +637,28 @@ class OpticDiscDetector:
         img_h, img_w = image.shape
         blurred = cv2.GaussianBlur(image, (9, 9), 2)
 
-        circles = cv2.HoughCircles(
-            blurred,
-            cv2.HOUGH_GRADIENT,
-            dp=1,
-            minDist=img_h // 3,
-            param1=50,
-            param2=30,
-            minRadius=img_h // 6,
-            maxRadius=min(img_h, img_w) // 2
-        )
+        # Real ultrasound B-scans vary a lot in contrast and speckle noise.
+        # A single fixed Canny/accumulator threshold (param1/param2) either
+        # misses low-contrast globes entirely or is too loose for cleaner
+        # ones. Start strict and progressively loosen until a circle is
+        # found, instead of jumping straight to the crude image-center
+        # fallback the first time the strict pass comes up empty.
+        circles = None
+        for param1, param2 in ((50, 30), (40, 25), (30, 20), (25, 15)):
+            circles = cv2.HoughCircles(
+                blurred,
+                cv2.HOUGH_GRADIENT,
+                dp=1,
+                minDist=img_h // 3,
+                param1=param1,
+                param2=param2,
+                minRadius=img_h // 6,
+                maxRadius=min(img_h, img_w) // 2
+            )
+            if circles is not None:
+                if self.debug:
+                    print(f"  Hough globe found at param1={param1}, param2={param2}")
+                break
 
         if circles is not None:
             circles = np.round(circles[0]).astype(int)
@@ -865,7 +921,16 @@ class OpticDiscDetector:
                     candidate['method'] = method_name
                     all_candidates.append(candidate)
 
-        good_candidates = self.filter_candidates(all_candidates, image.shape)
+        # For B-scans, locate the globe BEFORE picking the nerve candidate.
+        # Globe detection (Hough circle) doesn't depend on nerve position, so
+        # this order is safe — and it lets filter_candidates_bscan restrict
+        # its search to the anatomically correct region behind the globe
+        # instead of scoring brightness across the whole frame.
+        globe_bscan = None
+        if self.image_type == 'bscan':
+            globe_bscan = self._measure_globe_bscan(image)
+
+        good_candidates = self.filter_candidates(all_candidates, image.shape, globe=globe_bscan)
 
         if self.debug:
             print(f"Good candidates: {len(good_candidates)}")
@@ -889,7 +954,7 @@ class OpticDiscDetector:
             measurements['onsd_mm'] = self.px_to_mm(onsd_px)
 
             # 2. Posterior globe cross-sectional area & radius of curvature
-            globe = self.measure_posterior_globe(image, best)
+            globe = globe_bscan if self.image_type == 'bscan' else self.measure_posterior_globe(image, best)
             measurements['posterior_globe']          = globe
             measurements['posterior_globe_area']     = globe['cross_sectional_area']
             measurements['posterior_globe_area_mm2'] = self.px2_to_mm2(globe['cross_sectional_area'])
