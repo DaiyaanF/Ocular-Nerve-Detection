@@ -433,10 +433,17 @@ class OpticDiscDetector:
         if globe and globe.get('globe_radius') and globe.get('method') == 'hough_circle':
             gx, gy = globe['globe_center']
             gr = globe['globe_radius']
+            # The globe's own bottom edge is gy + gr (one full radius below
+            # its center), NOT gy + gr*0.45 — that earlier version measured
+            # the offset from the center, so the "posterior" band actually
+            # still overlapped the globe's own lower hemisphere. That's why
+            # candidates kept landing on the globe wall/rim instead of
+            # clearly behind it. Anchor to the bottom edge instead.
+            globe_bottom = gy + gr
             roi = {
-                'y_min': gy + gr * 0.45,   # just past the bottom of the globe wall
-                'y_max': gy + gr * 1.9,    # nerve complex sits within ~1x radius behind it
-                'x_min': gx - gr * 0.65,   # narrow band around the visual axis
+                'y_min': globe_bottom + gr * 0.03,  # just clear of the wall itself
+                'y_max': globe_bottom + gr * 0.9,   # nerve/sheath complex sits within ~1x radius behind it
+                'x_min': gx - gr * 0.65,            # narrow band around the visual axis
                 'x_max': gx + gr * 0.65,
             }
 
@@ -495,16 +502,23 @@ class OpticDiscDetector:
             vertical_score = min(cand['aspect_ratio'] / 2.0, 1.0)
             solidity_score = cand['solidity']
             if roi:
-                # Reward candidates closer to the globe's central axis —
-                # the nerve sits on it, artifacts off to the side don't.
+                # Reward candidates closer to the globe's central axis — but
+                # as a tie-breaker, not the dominant term. An earlier version
+                # weighted this at 0.25 and it was strong enough to let a
+                # weak, fragmented blob (low brightness, low solidity) beat a
+                # solid, coherent one just for sitting on-axis — confirmed on
+                # a real scan where the correct-looking candidate lost purely
+                # on this term. Solidity now carries real weight instead,
+                # since a coherent blob shape is stronger evidence of real
+                # tissue than raw pixel position.
                 gx = globe['globe_center'][0]
                 gr = globe['globe_radius']
                 axis_score = max(0.0, 1.0 - abs(cand['center'][0] - gx) / gr)
                 return (0.30 * brightness_score
-                        + 0.20 * height_score
-                        + 0.15 * vertical_score
-                        + 0.10 * solidity_score
-                        + 0.25 * axis_score)
+                        + 0.15 * height_score
+                        + 0.10 * vertical_score
+                        + 0.30 * solidity_score
+                        + 0.15 * axis_score)
             return (0.40 * brightness_score
                     + 0.25 * height_score
                     + 0.20 * vertical_score
@@ -662,18 +676,42 @@ class OpticDiscDetector:
 
         if circles is not None:
             circles = np.round(circles[0]).astype(int)
-            # Largest circle = globe
-            cx, cy, r = sorted(circles, key=lambda c: c[2], reverse=True)[0]
-            area = np.pi * r ** 2
-            if self.debug:
-                print(f"Posterior globe (Hough): center=({cx},{cy}), r={r}px, area={area:.0f}px²")
-            return {
-                'globe_center': (int(cx), int(cy)),
-                'globe_radius': float(r),
-                'cross_sectional_area': float(area),
-                'radius_of_curvature': float(r),
-                'method': 'hough_circle'
-            }
+            # Picking the largest circle isn't reliable on its own — Hough
+            # sometimes returns a spurious circle that's mostly cropped by
+            # the frame edge or sitting over unrelated tissue. The globe is
+            # specifically an anechoic (near-black) region on ultrasound, so
+            # score each candidate by how dark its interior actually is and
+            # how much of it falls inside the image, and take the best one
+            # rather than the biggest one.
+            best = None
+            best_score = -1.0
+            for cx, cy, r in circles:
+                mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                cv2.circle(mask, (int(cx), int(cy)), int(r), 255, -1)
+                interior = image[mask == 255]
+                full_area = np.pi * r * r
+                if full_area <= 0 or interior.size < 0.3 * full_area:
+                    continue  # more than 70% cropped off-frame — can't be the globe
+                darkness = 1.0 - (float(np.mean(interior)) / 255.0)
+                containment = interior.size / full_area
+                score = 0.6 * darkness + 0.4 * containment
+                if score > best_score:
+                    best_score = score
+                    best = (int(cx), int(cy), int(r))
+
+            if best is not None:
+                cx, cy, r = best
+                area = np.pi * r ** 2
+                if self.debug:
+                    print(f"Posterior globe (Hough): center=({cx},{cy}), r={r}px, "
+                          f"area={area:.0f}px², fit_score={best_score:.2f}")
+                return {
+                    'globe_center': (cx, cy),
+                    'globe_radius': float(r),
+                    'cross_sectional_area': float(area),
+                    'radius_of_curvature': float(r),
+                    'method': 'hough_circle'
+                }
 
         # Fallback: globe typically spans ~70 % of image height
         r = img_h * 0.35
