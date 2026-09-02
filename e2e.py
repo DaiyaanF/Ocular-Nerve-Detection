@@ -248,6 +248,18 @@ def _trace_posterior_boundary(img, exclude_mask=None):
     """
     h, w = img.shape
     mask = _multi_threshold(img)
+    # The raw threshold mask has thin downward "drips" hanging off the
+    # bottom of the main bright band into choroid speckle noise — connected
+    # to the main blob, so remove_small_objects (which only strips small
+    # SEPARATE components) can't touch them. Taking the deepest pixel of
+    # this raw mask grabs the tip of whatever drip happens to be longest in
+    # each column, producing a boundary that sits below the true band edge
+    # by a real, visible amount across the whole width (confirmed on real
+    # scans). A vertical opening (erode then dilate with a tall, thin
+    # kernel) strips 1-2px-wide drips while preserving the solid band, since
+    # erosion removes anything too thin to survive it.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = remove_small_objects(mask.astype(bool), max_size=30).astype(np.uint8)
 
     if exclude_mask is not None and np.any(exclude_mask):
