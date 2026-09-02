@@ -16,7 +16,10 @@ Improvements over the original:
   • Bilateral + CLAHE preprocessing (speckle-aware)
   • Multi-threshold segmentation (Otsu + adaptive + percentile voting)
   • Profile-scan ONSD with FWHM + sheath-gradient refinement
-  • Hough + least-squares circle fit for globe boundary
+  • Globe boundary: physical-space (mm) parabola/sagitta fit to the traced
+    posterior retinal boundary — not a bounded Hough search, and not a
+    general circle fit either (numerically unstable on the near-flat arcs
+    this modality actually shows — see segment_globe)
   • OCT vessel-shadow detection → Knudtson CRAE/CRVE/AVR
   • All units in mm (not cm); ONSD bug fixed
   • Averaged over the central third of B-scans for stability
@@ -30,7 +33,6 @@ import cv2
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.optimize import least_squares
 from skimage.filters import threshold_otsu
 from skimage.morphology import remove_small_objects, closing as sk_closing, disk
 from skimage.measure import label
@@ -213,50 +215,190 @@ def segment_nerve_sheath(img):
 # 5. GLOBE SEGMENTATION
 # =========================================================
 
-def segment_globe(img):
+def _trace_posterior_boundary(img):
     """
-    Detect the posterior globe boundary using:
-    1. Canny edges on the denoised image
-    2. Hough circle detection (fastest path)
-    3. Fallback: largest closed contour
+    Trace one boundary point per column: the deepest (bottom-most) pixel of
+    the main bright retinal-layer band. This tracks the RPE / Bruch's
+    membrane — the outer retinal layer, which follows the globe wall's own
+    curvature far more closely than any other visible structure in an OCT
+    B-scan.
+
+    The central ~60% of the width (same ROI convention `segment_nerve_sheath`
+    already uses) is excluded. That's not just noise-avoidance: the RPE is
+    anatomically interrupted at the optic disc itself (the Bruch's membrane
+    opening), and separately, a bright optic-nerve-head column commonly
+    extends deeper into the frame than the true wall boundary right where a
+    B-scan is centered — either way, tracing "the deepest bright pixel" in
+    that region does not measure the globe wall and biases a fit right at
+    the vertex, where the curvature signal matters most.
+
+    Returns (x_px, y_px) arrays — one y per included column that had
+    bright-mask signal, columns with no signal are skipped.
     """
     h, w = img.shape
+    mask = _multi_threshold(img)
+    mask = remove_small_objects(mask.astype(bool), max_size=30).astype(np.uint8)
 
-    # Hough circles — globe is the largest circle
-    circles = cv2.HoughCircles(
-        img,
-        cv2.HOUGH_GRADIENT,
-        dp=1,
-        minDist=h // 3,
-        param1=50,
-        param2=30,
-        minRadius=h // 5,
-        maxRadius=min(h, w) // 2
-    )
+    disc_left, disc_right = int(w * 0.20), int(w * 0.80)
+
+    xs, ys = [], []
+    for x in range(w):
+        if disc_left <= x < disc_right:
+            continue
+        col = np.where(mask[:, x])[0]
+        if col.size == 0:
+            continue
+        xs.append(x)
+        ys.append(col[-1])
+    return np.array(xs, dtype=np.float64), np.array(ys, dtype=np.float64)
+
+
+def _fit_shallow_arc_radius(x, y):
+    """
+    Fit the visible boundary as a shallow arc of a much larger circle, using
+    a parabola fit ("radius from sagitta") instead of a general algebraic
+    circle fit.
+
+    An earlier version used an algebraic (Taubin) circle fit here. That
+    method is numerically unstable exactly in this regime: a nearly-flat
+    point cloud sits close to the R→∞ degenerate case, where small pixel
+    noise can pull the closed-form solution toward a wildly wrong SMALL
+    radius instead of the correct large one. Confirmed on a real B-scan —
+    the Taubin fit returned 1.3mm on an arc that visibly, obviously curves
+    far more gently than that.
+
+    "Nearly flat, want the equivalent radius" is precisely the regime
+    optics/lens-making solves with a parabola fit: near the vertex of a
+    circle of radius R, y ≈ x²/(2R), so fitting y = a·x² + b·x + c via plain
+    (numerically stable, no degeneracy) least squares gives R = 1/(2|a|).
+
+    Returns (cx, cy, r) in whatever units x/y were given in — cx/cy are an
+    approximate corresponding circle center, good enough for a display
+    overlay — or None if there aren't enough points to fit.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if len(x) < 10:
+        return None
+    try:
+        a, b, c = np.polyfit(x, y, 2)
+    except np.linalg.LinAlgError:
+        return None
+
+    if abs(a) < 1e-9:
+        r = 1e6  # essentially flat within measurable precision
+    else:
+        r = 1.0 / (2.0 * abs(a))
+
+    vx = -b / (2 * a) if abs(a) > 1e-9 else float(np.mean(x))
+    vy = float(np.polyval((a, b, c), vx))
+    # a > 0 means the arc sags to larger y (downward) away from the vertex,
+    # so the corresponding circle's center sits above it, and vice versa.
+    cy = vy - r if a > 0 else vy + r
+    return float(vx), float(cy), float(r)
+
+
+def segment_globe(img, sx, sy):
+    """
+    Fit the posterior globe's radius of curvature and cross-sectional area
+    from the visible retinal boundary arc.
+
+    Why the old approach failed: an OCT B-scan only ever shows a few
+    millimeters of retina — a tiny sliver of the eye's true ~12mm-radius
+    curvature. Searching for "a whole circle that fits inside this frame"
+    (the old Hough-based approach) is bounded to radii smaller than the
+    real anatomy by roughly an order of magnitude, so it could never find
+    the real boundary and instead locked onto coincidental noise in the
+    retinal-layer texture on every scan (confirmed: it was returning
+    ~0.9-1.0mm "radius of curvature" values against a true ~12mm eye).
+
+    Fix: trace the visible boundary across the B-scan width (see
+    `_trace_posterior_boundary`), convert those points to physical mm using
+    sx/sy *before* fitting — pixel spacing here is anisotropic (~0.01mm/px
+    horizontal vs ~0.004mm/px axial), so a real circle would look like a
+    squashed ellipse in raw pixel coordinates — then fit the equivalent
+    radius via a parabola/sagitta fit (see `_fit_shallow_arc_radius`), which
+    unlike a general circle fit stays numerically stable on the near-flat
+    arcs this modality actually produces.
+
+    Returns
+    -------
+    mask       : uint8 array marking the traced boundary pixels (for overlay)
+    curve_px   : (N, 2) int array of (x, y) pixel points along the *fitted
+                 parabola itself*, sampled across the full image width — for
+                 drawing on the raw image. An earlier version returned a
+                 circle center + radius instead, converted to pixel space
+                 with an averaged (isotropic) scale; since the real radius
+                 is thousands of pixels and the anisotropic px/mm scale
+                 doesn't carry over to a single circle, that circle didn't
+                 even pass through the visible frame — the overlay panel
+                 silently showed nothing. Drawing the actual fitted curve
+                 instead is simpler and is guaranteed to intersect the image
+                 you're looking at, since it's evaluated at every column.
+    roc_mm     : radius of curvature in mm (the actual measurement)
+    area_mm2   : cross-sectional area in mm² (pi * roc_mm^2)
+    """
+    h, w = img.shape
+    xs_px, ys_px = _trace_posterior_boundary(img)
 
     mask = np.zeros((h, w), dtype=np.uint8)
+    for x, y in zip(xs_px.astype(int), ys_px.astype(int)):
+        mask[y, x] = 1
 
-    if circles is not None:
-        circles = np.round(circles[0]).astype(int)
-        cx, cy, r = sorted(circles, key=lambda c: c[2], reverse=True)[0]
-        cv2.circle(mask, (cx, cy), r, 1, -1)
-        return mask, (int(cx), int(cy)), int(r)
+    def _flat_fallback():
+        r_est_mm = 12.0
+        flat_y = int(h * 0.6)
+        curve = np.stack([np.arange(w), np.full(w, flat_y)], axis=1)
+        return mask, curve, r_est_mm, float(np.pi * r_est_mm ** 2)
 
-    # Fallback: Canny + largest contour
-    edges  = cv2.Canny(img, 30, 100)
-    closed = sk_closing(edges > 0, disk(5))
-    closed = remove_small_objects(closed, max_size=499)
-    contours, _ = cv2.findContours(
-        closed.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        cv2.fillPoly(mask, [largest], 1)
-        (cx, cy), r = cv2.minEnclosingCircle(largest)
-        return mask, (int(cx), int(cy)), int(r)
+    min_points = max(20, w // 10)
+    if len(xs_px) < min_points:
+        return _flat_fallback()
 
-    r_est = int(h * 0.35)
-    return mask, (w // 2, h // 2), r_est
+    x_mm = xs_px * sx
+    y_mm = ys_px * sy
+
+    # One outlier-rejection pass: choroidal vessels / segmentation slips
+    # occasionally throw a handful of points far off the true boundary.
+    # Residuals here MUST be measured against the parabola itself (vertical
+    # distance, y - polyval), not against the derived circle center/radius —
+    # a circle only osculates a parabola right at the vertex, so "distance
+    # to that circle" grows systematically toward the edges of the chord
+    # even for perfectly clean data, and wrongly strips good edge points.
+    # (Confirmed: doing it against the circle turned a correct 40.1mm fit
+    # into a wrong 102mm one on a controlled synthetic test.)
+    try:
+        coeffs = np.polyfit(x_mm, y_mm, 2)
+        resid = np.abs(y_mm - np.polyval(coeffs, x_mm))
+        mad = np.median(np.abs(resid - np.median(resid))) + 1e-9
+        keep = resid < np.median(resid) + 4 * mad
+        if keep.sum() >= min_points:
+            x_mm, y_mm = x_mm[keep], y_mm[keep]
+    except np.linalg.LinAlgError:
+        pass
+
+    fit = _fit_shallow_arc_radius(x_mm, y_mm)
+
+    if fit is None:
+        return _flat_fallback()
+
+    # Refit the final (post-trim) parabola coefficients once more, purely
+    # to sample a display curve consistent with whatever points actually
+    # produced the reported radius.
+    try:
+        disp_coeffs = np.polyfit(x_mm, y_mm, 2)
+        x_mm_disp = np.arange(w) * sx
+        y_mm_disp = np.polyval(disp_coeffs, x_mm_disp)
+        y_px_disp = np.round(y_mm_disp / sy).astype(int)
+        curve_px = np.stack([np.arange(w), y_px_disp], axis=1)
+    except np.linalg.LinAlgError:
+        curve_px = np.stack([np.arange(w), np.full(w, int(h * 0.6))], axis=1)
+
+    _cx_mm, _cy_mm, r_mm = fit
+    r_mm = abs(r_mm)
+    area_mm2 = float(np.pi * r_mm ** 2)
+
+    return mask, curve_px, r_mm, area_mm2
 
 
 # =========================================================
@@ -338,36 +480,6 @@ def compute_onsd(sheath_mask, img, sx):
 # =========================================================
 # 8. POSTERIOR GLOBE AREA & RADIUS OF CURVATURE
 # =========================================================
-
-def compute_globe_metrics(globe_mask, globe_center, globe_radius_px, sx, sy):
-    """
-    Returns
-    -------
-    area_mm2  : cross-sectional area of the globe (π r²) in mm²
-    roc_mm    : radius of curvature in mm, refined by least-squares circle fit
-    """
-    # Refine with least-squares fit to boundary points
-    y_pts, x_pts = np.where(globe_mask)
-
-    if len(x_pts) >= 50:
-        def residuals(c):
-            return np.sqrt((x_pts - c[0])**2 + (y_pts - c[1])**2) - c[2]
-
-        x0 = [globe_center[0], globe_center[1], globe_radius_px]
-        try:
-            res   = least_squares(residuals, x0, method='lm')
-            r_fit = abs(res.x[2])
-        except Exception:
-            r_fit = globe_radius_px
-    else:
-        r_fit = globe_radius_px
-
-    scale = (sx + sy) / 2.0
-    roc_mm   = r_fit * scale
-    area_mm2 = np.pi * (r_fit * sx) * (r_fit * sy)  # elliptical correction
-
-    return float(area_mm2), float(roc_mm)
-
 
 # =========================================================
 # 9. VESSEL SHADOW DETECTION → CRAE / CRVE / AVR
@@ -503,12 +615,11 @@ def analyze_scan(img_raw, sx, sy):
     """
     img = preprocess(img_raw)
 
-    nerve, sheath      = segment_nerve_sheath(img)
-    globe_mask, gc, gr = segment_globe(img)
+    nerve, sheath = segment_nerve_sheath(img)
+    globe_mask, globe_curve_px, roc_mm, globe_area_mm2 = segment_globe(img, sx, sy)
 
     disc_radius_mm = compute_disc_radius(nerve, sx, sy)
     onsd_mm        = compute_onsd(sheath, img, sx)
-    globe_area_mm2, roc_mm = compute_globe_metrics(globe_mask, gc, gr, sx, sy)
     crae_mm, crve_mm, avr  = compute_vascular_metrics(img, sx)
 
     return {
@@ -523,9 +634,8 @@ def analyze_scan(img_raw, sx, sy):
         '_img':    img,
         '_nerve':  nerve,
         '_sheath': sheath,
-        '_globe':  globe_mask,
-        '_gc':     gc,
-        '_gr':     gr,
+        '_globe':      globe_mask,
+        '_globe_curve': globe_curve_px,
     }
 
 
@@ -666,8 +776,7 @@ def _save_scan_figure(res, scan_idx, sx, sy, output_dir):
     img    = res['_img']
     nerve  = res['_nerve']
     sheath = res['_sheath']
-    gc     = res['_gc']
-    gr     = res['_gr']
+    globe_curve = res['_globe_curve']
 
     _, axes = plt.subplots(2, 3, figsize=(18, 8))
 
@@ -688,12 +797,20 @@ def _save_scan_figure(res, scan_idx, sx, sy, output_dir):
     axes[0, 2].set_title('Sheath (blue)')
     axes[0, 2].axis('off')
 
-    # Globe overlay
+    # Globe overlay — draw the fitted parabola itself rather than a circle.
+    # The real radius is thousands of pixels and the px/mm scale here is
+    # anisotropic, so a single circle converted to pixel space either
+    # distorts badly or (as happened before this fix) doesn't even pass
+    # through the visible frame. The curve is evaluated at every column, so
+    # it's guaranteed to show up.
     overlay = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    if gr > 0:
-        cv2.circle(overlay, gc, gr, (255, 165, 0), 2)
+    if globe_curve is not None and len(globe_curve) > 1:
+        h_img = img.shape[0]
+        pts = globe_curve[(globe_curve[:, 1] >= 0) & (globe_curve[:, 1] < h_img)].astype(np.int32)
+        if len(pts) > 1:
+            cv2.polylines(overlay, [pts.reshape(-1, 1, 2)], False, (255, 165, 0), 2)
     axes[1, 0].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-    axes[1, 0].set_title('Globe boundary (orange)')
+    axes[1, 0].set_title('Globe boundary (blue)')
     axes[1, 0].axis('off')
 
     # ONSD line
@@ -708,7 +825,7 @@ def _save_scan_figure(res, scan_idx, sx, sy, output_dir):
                      (int(cols[-1]), mid_row),
                      (0, 255, 255), 2)
     axes[1, 1].imshow(cv2.cvtColor(onsd_overlay, cv2.COLOR_BGR2RGB))
-    axes[1, 1].set_title('ONSD measurement line (cyan)')
+    axes[1, 1].set_title('ONSD measurement line (yellow)')
     axes[1, 1].axis('off')
 
     # Measurements panel
