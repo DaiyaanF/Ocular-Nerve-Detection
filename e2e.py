@@ -52,6 +52,15 @@ def load_e2e(file_path):
         .volume        — list of 2-D B-scan arrays
         .pixel_spacing — [sx_mm, sy_mm, sz_mm]  (x horizontal, y axial, z slice)
         .laterality    — 'L' or 'R'
+        .contours      — dict of {contour_name: [per-slice y-arrays]}, when the
+                         Spectralis software ran and saved its own automated
+                         layer segmentation for this acquisition. Real,
+                         device-computed boundaries (ILM, RNFL/GCL, ..., BM) —
+                         see get_layer_boundaries() for how these are used.
+                         Not every scan protocol has this (confirmed: fast
+                         macular-cube and preview scans often only have ILM+BM
+                         or just ILM; posterior-pole and wide RNFL scans have
+                         the full 11-boundary set).
 
     Returns
     -------
@@ -62,6 +71,7 @@ def load_e2e(file_path):
         'laterality' : str  ('L', 'R', or 'U')
         'series_idx' : int
         'patient_id' : str
+        'contours'   : dict or None — raw contour dict from oct_converter
     """
     e2e      = E2E(file_path)
     vol_list = e2e.read_oct_volume()
@@ -92,6 +102,7 @@ def load_e2e(file_path):
                 'laterality': getattr(vol, 'laterality', 'U'),
                 'series_idx': i,
                 'patient_id': str(getattr(vol, 'patient_id', '')),
+                'contours':   getattr(vol, 'contours', None),
             })
         except Exception as exc:
             print(f"  Skipping series {i}: {exc}")
@@ -435,6 +446,151 @@ def segment_globe(img, sx, sy, exclude_mask=None):
 
 
 # =========================================================
+# 5b. REAL LAYER BOUNDARIES FROM DEVICE SEGMENTATION
+# =========================================================
+#
+# The Spectralis device runs its own automated retinal-layer segmentation
+# at acquisition time and saves it inside the E2E file. oct_converter (our
+# existing dependency, loaded via `from oct_converter.readers import E2E`)
+# already parses this out as `volume.contours` -- a dict of anonymous
+# names ("contour0", "contour1", ...) to per-slice y-coordinate arrays, one
+# y-value per column.
+#
+# This is a categorically different, and far better, source of boundary
+# data than everything above in this file: it's the same segmentation a
+# clinician would see in the Spectralis viewer, not a brightness-threshold
+# guess. Verified directly against all 4 real Ax2 .E2E files:
+#
+#   contour0 = ILM (top of retina)             -- present on ~all scans
+#   contour1 = BM / Bruch's membrane (outer)    -- present on most scans,
+#                                                   but confirmed ALWAYS
+#                                                   0% valid on the 27-scan
+#                                                   "fast/preview" protocol
+#   contour2 = bottom of RNFL/GCL layer         -- only present (and only
+#                                                   valid) on the 61-scan
+#                                                   posterior-pole and
+#                                                   19-scan wide-RNFL
+#                                                   protocols; either absent
+#                                                   or always-NaN elsewhere
+#
+# (Confirmed by overlaying each contour on real B-scans and checking it
+# against visible anatomy -- see conversation history, not guessed from
+# the anonymous names alone. contour2's identity, specifically, was
+# confirmed via the full 11-boundary posterior-pole/wide-RNFL scans, where
+# sorting all contours by mean y-position gives exactly the standard
+# Heidelberg top-to-bottom layer order: ILM, RNFL/GCL, GCL/IPL, IPL/INL,
+# INL/OPL, OPL/ONL, ELM, EZ, OS/RPE, RPE, BM.)
+#
+
+def get_layer_boundaries(contours, slice_idx, width):
+    """
+    Extract ILM, BM, and RNFL-bottom boundary y-arrays (pixel space) for one
+    B-scan slice, from the device's own embedded segmentation.
+
+    Returns (ilm, bm, rnfl_bottom), each a float array of length `width`
+    with NaN where a value is unavailable or the contour doesn't exist for
+    this scan's protocol. Any of the three may come back all-NaN -- that's
+    expected and handled by the callers, not an error.
+    """
+    def _get(name):
+        if not contours or name not in contours:
+            return np.full(width, np.nan)
+        try:
+            raw = contours[name][slice_idx]
+        except (IndexError, KeyError):
+            return np.full(width, np.nan)
+        # Some slices have no segmentation saved at all for a given contour
+        # (the device didn't compute/save it for that frame specifically),
+        # coming through as a bare None rather than a NaN-filled array.
+        if raw is None:
+            return np.full(width, np.nan)
+        arr = np.array(raw, dtype=float)
+        if arr.ndim == 0 or arr.shape[0] != width:
+            return np.full(width, np.nan)
+        return arr
+
+    return _get('contour0'), _get('contour1'), _get('contour2')
+
+
+def compute_layer_thickness_metrics(ilm, bm, rnfl_bottom, sy, min_valid_frac=0.5):
+    """
+    Real retinal thickness (ILM -> BM) and RNFL thickness (ILM -> RNFL
+    bottom), in mm, computed directly from device-segmented boundaries.
+
+    Returns NaN for either metric when the required boundaries aren't
+    reliably present for this particular scan (see module note above) --
+    reporting NaN honestly rather than estimating from pixel brightness the
+    way this file used to.
+    """
+    def _thickness(top, bottom):
+        valid = ~np.isnan(top) & ~np.isnan(bottom)
+        if valid.mean() < min_valid_frac:
+            return float('nan')
+        diff_px = bottom[valid] - top[valid]
+        return float(np.median(diff_px) * sy)
+
+    retinal_thickness_mm = _thickness(ilm, bm)
+    rnfl_thickness_mm    = _thickness(ilm, rnfl_bottom)
+    return retinal_thickness_mm, rnfl_thickness_mm
+
+
+def fit_posterior_curvature(bm, sx, sy, min_valid_frac=0.5):
+    """
+    Fit posterior curvature (radius + derived area) from the device
+    segmented Bruch's membrane boundary directly -- no pixel thresholding,
+    no drip artifacts, no disc-exclusion-window guessing needed, since the
+    real boundary is already known at every valid column (including
+    straight through the fovea, and the optic disc when in frame).
+
+    Returns (curve_px, roc_mm, area_mm2). curve_px is an (N,2) int array
+    for overlay drawing, or None. roc_mm/area_mm2 are NaN when BM isn't
+    reliably present for this scan's protocol (see module note above).
+    """
+    w = len(bm)
+    valid = ~np.isnan(bm)
+    if valid.mean() < min_valid_frac:
+        return None, float('nan'), float('nan')
+
+    xs_px = np.where(valid)[0].astype(np.float64)
+    ys_px = bm[valid].astype(np.float64)
+    x_mm = xs_px * sx
+    y_mm = ys_px * sy
+
+    # Outlier rejection in the same spirit as the old heuristic path: even
+    # device segmentation occasionally slips at a handful of columns
+    # (e.g. a shadow from a large vessel), and the fit should ignore those
+    # rather than let them bias the whole curve.
+    try:
+        coeffs = np.polyfit(x_mm, y_mm, 2)
+        resid = np.abs(y_mm - np.polyval(coeffs, x_mm))
+        mad = np.median(np.abs(resid - np.median(resid))) + 1e-9
+        keep = resid < np.median(resid) + 4 * mad
+        if keep.sum() >= max(20, w // 10):
+            x_mm, y_mm = x_mm[keep], y_mm[keep]
+    except np.linalg.LinAlgError:
+        pass
+
+    fit = _fit_shallow_arc_radius(x_mm, y_mm)
+    if fit is None:
+        return None, float('nan'), float('nan')
+
+    curve_px = None
+    try:
+        disp_coeffs = np.polyfit(x_mm, y_mm, 2)
+        x_mm_disp = np.arange(w) * sx
+        y_mm_disp = np.polyval(disp_coeffs, x_mm_disp)
+        y_px_disp = np.round(y_mm_disp / sy).astype(int)
+        curve_px = np.stack([np.arange(w), y_px_disp], axis=1)
+    except np.linalg.LinAlgError:
+        pass
+
+    _cx_mm, _cy_mm, r_mm = fit
+    r_mm = abs(r_mm)
+    area_mm2 = float(np.pi * r_mm ** 2)
+    return curve_px, r_mm, area_mm2
+
+
+# =========================================================
 # 6. OPTIC DISC RADIUS
 # =========================================================
 
@@ -457,61 +613,67 @@ def compute_disc_radius(nerve_mask, sx, sy):
     return float(r_px) * scale
 
 
-# =========================================================
-# 7. ONSD  (profile-scan FWHM with sheath-gradient refinement)
-# =========================================================
-
-def compute_onsd(sheath_mask, img, sx):
+def measure_disc_radius_from_ilm(ilm, sx, min_depth_px=100):
     """
-    Measure ONSD in mm via horizontal profile scan through the nerve.
+    Estimate optic disc radius from the ILM boundary's depression into the
+    optic cup -- real device-segmented data, used in place of
+    compute_disc_radius's brightness-threshold heuristic whenever a scan
+    actually shows the disc.
 
-    For each of 5 evenly-spaced rows in the sheath region:
-      1. Smooth the intensity profile
-      2. Find the FWHM of the sheath echo
-    Return the median width × sx.
+    Why not just use the BMO (Bruch's Membrane Opening) width, the standard
+    clinical technique? Checked directly against the real Ax2 data: the
+    disc-centered scan protocol there has its BM/RPE contour (contour1)
+    ALWAYS invalid (confirmed 0% valid across every file) -- the device's
+    own auto-segmentation apparently doesn't attempt BM/RPE at the disc at
+    all (the RPE is anatomically absent there, which is presumably why).
+    With no valid BM signal, there's no gap to measure a BMO width from.
+
+    ILM (contour0), by contrast, IS reliably present and visibly plunges
+    into the cup at the disc (confirmed by direct inspection of real scans
+    -- a deep, sharp V, unmistakably different from the much shallower
+    foveal pit). So: find where the ILM sits above the half-depth point of
+    its own depression (FWHM-style, like this file's other threshold
+    crossings) and measure that span.
+
+    This uses a FWHM threshold rather than a fixed pixel offset because a
+    disc-centered scan's field of view is dominated by the gradual slope
+    down into the cup -- there's no flat "normal retina" near the frame
+    edges to use as an absolute depth reference (confirmed: an absolute
+    15px-above-baseline threshold caught 60%+ of the frame width, ~3x a
+    real disc diameter).
+
+    Returns radius in mm, or NaN when this scan doesn't show a real,
+    disc-scale depression (min_depth_px guards against the much shallower
+    foveal dip -- confirmed ~20-30px there vs 200px+ for real disc cupping
+    -- so a normal macular scan correctly falls through to the brightness
+    heuristic instead of reporting a fake "disc" at the fovea).
     """
-    rows = np.where(np.sum(sheath_mask, axis=1) > 0)[0]
-    if len(rows) < 3:
-        return np.nan
-
-    # Sample rows across the middle 60 % of the sheath height
-    lo = rows[int(len(rows) * 0.20)]
-    hi = rows[int(len(rows) * 0.80)]
-    sample_rows = np.linspace(lo, hi, 7, dtype=int)
-
-    widths_px = []
-    ks = int(6 * 3 + 1) | 1
-    x  = np.arange(ks) - ks // 2
-    k  = np.exp(-0.5 * (x / 3.0) ** 2);  k /= k.sum()
-
-    for row in sample_rows:
-        profile = img[row, :].astype(float)
-        smooth  = np.convolve(profile, k, mode='same')
-
-        bg      = float(np.median(smooth[:len(smooth)//5]))
-        peak    = float(np.max(smooth))
-        if peak <= bg + 5:
-            continue
-
-        thresh  = bg + 0.40 * (peak - bg)
-        above   = smooth > thresh
-        if not np.any(above):
-            continue
-        idxs = np.where(above)[0]
-        w    = int(idxs[-1] - idxs[0])
-        if w > 3:
-            widths_px.append(w)
-
-    if not widths_px:
-        # Fallback: bounding-box width × 1.15
-        cols = np.where(np.sum(sheath_mask, axis=0) > 0)[0]
-        return float(len(cols)) * 1.15 * sx if len(cols) > 0 else np.nan
-
-    return float(np.median(widths_px)) * sx
+    valid = ~np.isnan(ilm)
+    if valid.sum() < 20:
+        return float('nan')
+    baseline = float(np.percentile(ilm[valid], 5))
+    peak = float(np.nanmax(ilm[valid]))
+    if peak - baseline < min_depth_px:
+        return float('nan')
+    half = baseline + 0.5 * (peak - baseline)
+    idx = np.where(valid & (ilm > half))[0]
+    if len(idx) < 2:
+        return float('nan')
+    width_px = int(idx.max() - idx.min())
+    return float(width_px * sx) / 2.0
 
 
 # =========================================================
-# 8. POSTERIOR GLOBE AREA & RADIUS OF CURVATURE
+# NOTE: ONSD (Optic Nerve Sheath Diameter) was removed from this file.
+# It was computed as the horizontal width of segment_nerve_sheath's
+# brightness-thresholded "sheath" mask -- but ONSD is a retrobulbar
+# ultrasound measurement (the nerve sheath sits *behind* the eye); a
+# standard macular/peripapillary OCT B-scan physically cannot image that
+# structure. What was being measured was the width of a bright
+# retinal-layer band near the disc, mislabeled with a clinical term that
+# refers to something else entirely. See RNFL/retinal thickness above
+# (get_layer_boundaries, compute_layer_thickness_metrics) for the real,
+# device-segmented replacement metrics.
 # =========================================================
 
 # =========================================================
@@ -638,37 +800,66 @@ def compute_vascular_metrics(img, sx):
 # 10. PER-SCAN ANALYSIS
 # =========================================================
 
-def analyze_scan(img_raw, sx, sy):
+def analyze_scan(img_raw, sx, sy, contours=None, slice_idx=None):
     """
     Run the full pipeline on a single B-scan.
 
-    Returns a dict with keys matching the fundus detector output:
-      disc_radius_mm, onsd_mm, globe_area_mm2, roc_mm,
-      crae_mm, crve_mm, avr
+    `contours`/`slice_idx`: the series' raw device-segmentation dict (from
+    load_e2e) and this scan's index within it. When available, retinal/RNFL
+    thickness and posterior curvature are computed from the Spectralis
+    device's own segmentation (see the "REAL LAYER BOUNDARIES" section
+    above) instead of guessed from pixel brightness. Any of these may come
+    back NaN when the scan's protocol didn't save the needed boundary
+    (confirmed: RNFL specifically is only present on posterior-pole and
+    wide-RNFL scan protocols, not the standard macular cube) -- that's
+    reported honestly, not silently estimated.
+
+    Returns a dict with keys:
+      disc_radius_mm, retinal_thickness_mm, rnfl_thickness_mm,
+      globe_area_mm2, roc_mm, crae_mm, crve_mm, avr
     """
     img = preprocess(img_raw)
+    w = img.shape[1]
 
-    nerve, sheath = segment_nerve_sheath(img)
-    globe_mask, globe_curve_px, roc_mm, globe_area_mm2 = segment_globe(img, sx, sy, exclude_mask=sheath)
+    nerve, _sheath = segment_nerve_sheath(img)
+    crae_mm, crve_mm, avr = compute_vascular_metrics(img, sx)
 
-    disc_radius_mm = compute_disc_radius(nerve, sx, sy)
-    onsd_mm        = compute_onsd(sheath, img, sx)
-    crae_mm, crve_mm, avr  = compute_vascular_metrics(img, sx)
+    if contours is not None and slice_idx is not None:
+        ilm, bm, rnfl_bottom = get_layer_boundaries(contours, slice_idx, w)
+    else:
+        ilm = bm = rnfl_bottom = np.full(w, np.nan)
+
+    # Disc radius: prefer the real ILM-depression measurement (only valid
+    # when this particular scan actually shows the disc); fall back to the
+    # brightness heuristic otherwise, e.g. no contour data at all, or a
+    # scan that doesn't cross the disc (get_disc-scale NaN check handles
+    # this -- see measure_disc_radius_from_ilm for why).
+    disc_radius_mm = measure_disc_radius_from_ilm(ilm, sx)
+    disc_radius_source = 'ilm'
+    if np.isnan(disc_radius_mm):
+        disc_radius_mm = compute_disc_radius(nerve, sx, sy)
+        disc_radius_source = 'heuristic'
+
+    retinal_thickness_mm, rnfl_thickness_mm = compute_layer_thickness_metrics(ilm, bm, rnfl_bottom, sy)
+    globe_curve_px, roc_mm, globe_area_mm2 = fit_posterior_curvature(bm, sx, sy)
 
     return {
-        'disc_radius_mm':  disc_radius_mm,
-        'onsd_mm':         onsd_mm,
-        'globe_area_mm2':  globe_area_mm2,
-        'roc_mm':          roc_mm,
-        'crae_mm':         crae_mm,
-        'crve_mm':         crve_mm,
-        'avr':             avr,
+        'disc_radius_mm':        disc_radius_mm,
+        'disc_radius_source':    disc_radius_source,  # 'ilm' (real) or 'heuristic' (fallback)
+        'retinal_thickness_mm':  retinal_thickness_mm,
+        'rnfl_thickness_mm':     rnfl_thickness_mm,
+        'globe_area_mm2':        globe_area_mm2,
+        'roc_mm':                roc_mm,
+        'crae_mm':               crae_mm,
+        'crve_mm':               crve_mm,
+        'avr':                   avr,
         # internals for visualisation
-        '_img':    img,
-        '_nerve':  nerve,
-        '_sheath': sheath,
-        '_globe':      globe_mask,
-        '_globe_curve': globe_curve_px,
+        '_img':          img,
+        '_nerve':         nerve,
+        '_ilm':           ilm,
+        '_bm':            bm,
+        '_rnfl_bottom':   rnfl_bottom,
+        '_globe_curve':   globe_curve_px,
     }
 
 
@@ -726,22 +917,26 @@ def analyze_e2e(file_path, output_dir=None, pixels_per_mm_x=None, pixels_per_mm_
         ser_dir = os.path.join(output_dir, label)
         os.makedirs(ser_dir, exist_ok=True)
 
+        contours = ser.get('contours')
+
         records = []
         for i, scan in enumerate(scans):
             print(f"    scan {i+1}/{n}", end='\r')
-            res = analyze_scan(scan, sx, sy)
+            res = analyze_scan(scan, sx, sy, contours=contours, slice_idx=i)
 
             records.append({
-                'series':          label,
-                'laterality':      lat,
-                'scan_index':      i,
-                'disc_radius_mm':  res['disc_radius_mm'],
-                'onsd_mm':         res['onsd_mm'],
-                'globe_area_mm2':  res['globe_area_mm2'],
-                'roc_mm':          res['roc_mm'],
-                'crae_mm':         res['crae_mm'],
-                'crve_mm':         res['crve_mm'],
-                'avr':             res['avr'],
+                'series':                 label,
+                'laterality':             lat,
+                'scan_index':             i,
+                'disc_radius_mm':         res['disc_radius_mm'],
+                'disc_radius_source':     res['disc_radius_source'],
+                'retinal_thickness_mm':   res['retinal_thickness_mm'],
+                'rnfl_thickness_mm':      res['rnfl_thickness_mm'],
+                'globe_area_mm2':         res['globe_area_mm2'],
+                'roc_mm':                 res['roc_mm'],
+                'crae_mm':                res['crae_mm'],
+                'crve_mm':                res['crve_mm'],
+                'avr':                    res['avr'],
             })
 
             _save_scan_figure(res, i, sx, sy, ser_dir)
@@ -762,8 +957,29 @@ def analyze_e2e(file_path, output_dir=None, pixels_per_mm_x=None, pixels_per_mm_
             return float(np.median(vals)) if len(vals) > 0 else np.nan
 
         ser_summary = {k: _med(k) for k in
-                       ['disc_radius_mm', 'onsd_mm', 'globe_area_mm2',
-                        'roc_mm', 'crae_mm', 'crve_mm', 'avr']}
+                       ['retinal_thickness_mm', 'rnfl_thickness_mm',
+                        'globe_area_mm2', 'roc_mm', 'crae_mm', 'crve_mm', 'avr']}
+
+        # Disc radius: real (ILM-depression) values only show up on scans
+        # that actually cross the disc. Confirmed on real data that a WIDE
+        # macular-cube sweep can graze the disc's edge for a handful of its
+        # scans without being centered on it -- those grazing crossings cut
+        # through the cup at an oblique angle/shallow point, systematically
+        # UNDER-measuring width (a cone is narrower away from its rim), and
+        # gave an implausible ~0.35mm radius (0.7mm diameter -- smaller than
+        # any real human disc) versus ~0.64mm radius (1.27mm diameter, real
+        # clinical range) from a properly disc-centered acquisition where
+        # essentially every scan in the series crosses it. So: only trust
+        # this series' real values when most of it shows a crossing (a
+        # deliberate disc-centered scan), not just a handful of grazing
+        # hits within a much larger sweep that was aimed elsewhere.
+        ilm_rows = central[central['disc_radius_source'] == 'ilm']
+        is_disc_centered = len(central) > 0 and len(ilm_rows) / len(central) >= 0.5
+        disc_source_rows = ilm_rows if is_disc_centered else central
+        disc_vals = disc_source_rows['disc_radius_mm'].dropna()
+        ser_summary['disc_radius_mm'] = float(np.median(disc_vals)) if len(disc_vals) > 0 else np.nan
+        ser_summary['disc_radius_is_real'] = is_disc_centered
+
         ser_summary['series']     = label
         ser_summary['laterality'] = lat
         ser_summary['n_scans']    = n
@@ -782,12 +998,22 @@ def analyze_e2e(file_path, output_dir=None, pixels_per_mm_x=None, pixels_per_mm_
               index=False, float_format='%.4f')
 
     # ---- Overall summary: median across all per-series medians ----------------
-    metric_keys = ['disc_radius_mm', 'onsd_mm', 'globe_area_mm2',
-                   'roc_mm', 'crae_mm', 'crve_mm', 'avr']
+    metric_keys = ['retinal_thickness_mm', 'rnfl_thickness_mm',
+                   'globe_area_mm2', 'roc_mm', 'crae_mm', 'crve_mm', 'avr']
     summary = {}
     for k in metric_keys:
         vals = [s[k] for s in series_summaries if not np.isnan(s[k])]
         summary[k] = float(np.median(vals)) if vals else np.nan
+
+    # Disc radius: same "prefer real over heuristic" rule as the per-series
+    # aggregation above, one level up -- if any series in this acquisition
+    # actually crossed the disc (disc_radius_is_real), use only those
+    # series' medians; a fovea-centered series' heuristic-based "disc
+    # radius" isn't a real measurement of the same thing and shouldn't get
+    # blended in just because it's numerically present.
+    real_series = [s for s in series_summaries if s.get('disc_radius_is_real') and not np.isnan(s['disc_radius_mm'])]
+    disc_source_series = real_series if real_series else [s for s in series_summaries if not np.isnan(s['disc_radius_mm'])]
+    summary['disc_radius_mm'] = float(np.median([s['disc_radius_mm'] for s in disc_source_series])) if disc_source_series else np.nan
 
     pd.DataFrame([summary]).to_csv(
         os.path.join(output_dir, "oct_summary.csv"),
@@ -806,10 +1032,12 @@ def analyze_e2e(file_path, output_dir=None, pixels_per_mm_x=None, pixels_per_mm_
 
 def _save_scan_figure(res, scan_idx, sx, sy, output_dir):
     """Save a 2×3 figure for one B-scan."""
-    img    = res['_img']
-    nerve  = res['_nerve']
-    sheath = res['_sheath']
-    globe_curve = res['_globe_curve']
+    img          = res['_img']
+    nerve        = res['_nerve']
+    ilm          = res['_ilm']
+    bm           = res['_bm']
+    rnfl_bottom  = res['_rnfl_bottom']
+    globe_curve  = res['_globe_curve']
 
     _, axes = plt.subplots(2, 3, figsize=(18, 8))
 
@@ -818,16 +1046,30 @@ def _save_scan_figure(res, scan_idx, sx, sy, output_dir):
     axes[0, 0].set_title(f'B-scan {scan_idx} (preprocessed)')
     axes[0, 0].axis('off')
 
-    # Nerve mask
+    # Nerve mask (still brightness-based -- used only for disc radius)
     axes[0, 1].imshow(img, cmap='gray')
     axes[0, 1].imshow(nerve, cmap='Reds', alpha=0.4)
     axes[0, 1].set_title('Nerve (red)')
     axes[0, 1].axis('off')
 
-    # Sheath mask
+    # RNFL region -- shaded between the device-segmented ILM and RNFL/GCL
+    # boundaries. Only present on posterior-pole/wide-RNFL scan protocols;
+    # shown blank with a caption when this scan's protocol doesn't have it,
+    # rather than silently guessing.
     axes[0, 2].imshow(img, cmap='gray')
-    axes[0, 2].imshow(sheath, cmap='Blues', alpha=0.4)
-    axes[0, 2].set_title('Sheath (blue)')
+    rnfl_valid = ~np.isnan(ilm) & ~np.isnan(rnfl_bottom)
+    if rnfl_valid.any():
+        h_img = img.shape[0]
+        rnfl_mask = np.zeros_like(img, dtype=np.uint8)
+        for x in np.where(rnfl_valid)[0]:
+            y0, y1 = int(ilm[x]), int(rnfl_bottom[x])
+            y0, y1 = max(0, min(y0, h_img)), max(0, min(y1, h_img))
+            if y1 > y0:
+                rnfl_mask[y0:y1, x] = 1
+        axes[0, 2].imshow(rnfl_mask, cmap='Reds', alpha=0.4)
+        axes[0, 2].set_title('RNFL region (red)')
+    else:
+        axes[0, 2].set_title('RNFL region (not available for this scan protocol)')
     axes[0, 2].axis('off')
 
     # Globe overlay — draw the fitted parabola itself rather than a circle.
@@ -846,19 +1088,21 @@ def _save_scan_figure(res, scan_idx, sx, sy, output_dir):
     axes[1, 0].set_title('Globe boundary (blue)')
     axes[1, 0].axis('off')
 
-    # ONSD line
-    onsd_overlay = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    sheath_rows  = np.where(np.sum(sheath, axis=1) > 0)[0]
-    if len(sheath_rows) >= 3:
-        mid_row = int(np.median(sheath_rows))
-        cols    = np.where(sheath[mid_row] > 0)[0]
-        if len(cols) > 0:
-            cv2.line(onsd_overlay,
-                     (int(cols[0]), mid_row),
-                     (int(cols[-1]), mid_row),
-                     (0, 255, 255), 2)
-    axes[1, 1].imshow(cv2.cvtColor(onsd_overlay, cv2.COLOR_BGR2RGB))
-    axes[1, 1].set_title('ONSD measurement line (yellow)')
+    # Retinal thickness line -- vertical span between the device-segmented
+    # ILM and BM boundaries at the image's central column, where both are
+    # valid. Replaces the old "ONSD measurement line", which measured the
+    # width of a brightness-thresholded blob near the disc and had nothing
+    # to do with the real (retrobulbar, not visible in OCT) ONSD.
+    thickness_overlay = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    both_valid = np.where(~np.isnan(ilm) & ~np.isnan(bm))[0]
+    if len(both_valid) > 0:
+        col = both_valid[len(both_valid) // 2]
+        cv2.line(thickness_overlay,
+                 (int(col), int(ilm[col])),
+                 (int(col), int(bm[col])),
+                 (0, 255, 255), 2)
+    axes[1, 1].imshow(cv2.cvtColor(thickness_overlay, cv2.COLOR_BGR2RGB))
+    axes[1, 1].set_title('Retinal thickness (ILM–BM, yellow)')
     axes[1, 1].axis('off')
 
     # Measurements panel
@@ -879,13 +1123,14 @@ def _save_scan_figure(res, scan_idx, sx, sy, output_dir):
         f"Scale: {sx:.5f} mm/px (x)",
         f"       {sy:.5f} mm/px (y)",
         "",
-        f"Disc Radius : {_mm(res.get('disc_radius_mm'))}",
-        f"ONSD        : {_mm(res.get('onsd_mm'))}",
-        f"Globe Area  : {_mm2(res.get('globe_area_mm2'))}",
-        f"RoC         : {_mm(res.get('roc_mm'))}",
-        f"CRAE        : {_mm(res.get('crae_mm'), 4)}",
-        f"CRVE        : {_mm(res.get('crve_mm'), 4)}",
-        f"AVR         : {f'{avr:.3f}{avr_norm}' if avr and not np.isnan(avr) else 'N/A'}",
+        f"Disc Radius       : {_mm(res.get('disc_radius_mm'))}",
+        f"Retinal Thickness : {_mm(res.get('retinal_thickness_mm'))}",
+        f"RNFL Thickness    : {_mm(res.get('rnfl_thickness_mm'))}",
+        f"Post. Curvature Area : {_mm2(res.get('globe_area_mm2'))}",
+        f"RoC (local)       : {_mm(res.get('roc_mm'))}",
+        f"CRAE              : {_mm(res.get('crae_mm'), 4)}",
+        f"CRVE              : {_mm(res.get('crve_mm'), 4)}",
+        f"AVR               : {f'{avr:.3f}{avr_norm}' if avr and not np.isnan(avr) else 'N/A'}",
     ]
 
     axes[1, 2].text(0.05, 0.95, "\n".join(lines),
@@ -920,14 +1165,15 @@ def _print_report(summary, file_path, n_scans, output_dir):
     print(f"File    : {os.path.basename(file_path)}")
     print(f"B-scans : {n_scans}  (median over central third)")
     print(sep)
-    print(f"Disc Radius : {_mm(summary.get('disc_radius_mm'))}")
-    print(f"ONSD        : {_mm(summary.get('onsd_mm'))}")
-    print(f"Globe Area  : {_mm2(summary.get('globe_area_mm2'))}")
-    print(f"RoC         : {_mm(summary.get('roc_mm'))}")
-    print(f"CRAE        : {_mm(summary.get('crae_mm'), 4)}")
-    print(f"CRVE        : {_mm(summary.get('crve_mm'), 4)}")
+    print(f"Disc Radius          : {_mm(summary.get('disc_radius_mm'))}")
+    print(f"Retinal Thickness    : {_mm(summary.get('retinal_thickness_mm'))}")
+    print(f"RNFL Thickness       : {_mm(summary.get('rnfl_thickness_mm'))}")
+    print(f"Post. Curvature Area : {_mm2(summary.get('globe_area_mm2'))}")
+    print(f"RoC (local curvature): {_mm(summary.get('roc_mm'))}")
+    print(f"CRAE                 : {_mm(summary.get('crae_mm'), 4)}")
+    print(f"CRVE                 : {_mm(summary.get('crve_mm'), 4)}")
     avr_str = f"{avr:.3f}{avr_norm}" if avr and not np.isnan(avr) else "N/A"
-    print(f"AVR         : {avr_str}")
+    print(f"AVR                  : {avr_str}")
     print(sep)
     print(f"Results saved to: {output_dir}")
     print(sep)
@@ -987,13 +1233,14 @@ def select_e2e_and_run():
         avr_str = f"{avr:.3f}{avr_norm}" if avr and not np.isnan(avr) else "N/A"
 
         msg = (
-            f"Disc Radius : {_mm(summary.get('disc_radius_mm'))}\n"
-            f"ONSD        : {_mm(summary.get('onsd_mm'))}\n"
-            f"Globe Area  : {_mm2(summary.get('globe_area_mm2'))}\n"
-            f"RoC         : {_mm(summary.get('roc_mm'))}\n"
-            f"CRAE        : {_mm(summary.get('crae_mm'), 4)}\n"
-            f"CRVE        : {_mm(summary.get('crve_mm'), 4)}\n"
-            f"AVR         : {avr_str}\n\n"
+            f"Disc Radius       : {_mm(summary.get('disc_radius_mm'))}\n"
+            f"Retinal Thickness : {_mm(summary.get('retinal_thickness_mm'))}\n"
+            f"RNFL Thickness    : {_mm(summary.get('rnfl_thickness_mm'))}\n"
+            f"Post. Curv. Area  : {_mm2(summary.get('globe_area_mm2'))}\n"
+            f"RoC (local)       : {_mm(summary.get('roc_mm'))}\n"
+            f"CRAE              : {_mm(summary.get('crae_mm'), 4)}\n"
+            f"CRVE              : {_mm(summary.get('crve_mm'), 4)}\n"
+            f"AVR               : {avr_str}\n\n"
             f"Results: {output_dir}"
         )
         from tkinter import messagebox as _mb
@@ -1084,8 +1331,8 @@ def process_all_e2e(input_dir, output_dir=None, pixels_per_mm_x=None, pixels_per
     print(f"{'='*60}")
     print(f"Total: {len(e2e_files)}  |  OK: {ok_count}  |  Failed: {fail_count}")
 
-    cols = ['subject', 'disc_radius_mm', 'onsd_mm', 'globe_area_mm2',
-            'roc_mm', 'crae_mm', 'crve_mm', 'avr']
+    cols = ['subject', 'disc_radius_mm', 'retinal_thickness_mm', 'rnfl_thickness_mm',
+            'globe_area_mm2', 'roc_mm', 'crae_mm', 'crve_mm', 'avr']
     display_cols = [c for c in cols if c in batch_df.columns]
     print(batch_df[display_cols].to_string(index=False, float_format=lambda x: f"{x:.3f}"))
 
